@@ -137,6 +137,45 @@ if __name__ == "__main__":
                     print(
                         "        observation key {} with shape {}".format(obs_k, shape)
                     )
+            elif k in ["object_pcds"]:
+                print("    key: {}".format(k))
+                for pcd_k in f["data/{}/{}".format(ep, k)]:
+                    shape = f["data/{}/{}/{}".format(ep, k, pcd_k)].shape
+                    print(
+                        "        object pcd key {} with shape {}".format(pcd_k, shape)
+                    )
+            elif k in ["object_poses"]:
+                print("    key: {}".format(k))
+                for pose_k in f["data/{}/{}".format(ep, k)]:
+                    shape = f["data/{}/{}/{}".format(ep, k, pose_k)].shape
+                    print(
+                        "        object pose key {} with shape {}".format(pose_k, shape)
+                    )
+            elif k in ["object_distances"]:
+                print("    key: {}".format(k))
+                dist_group = f["data/{}/{}".format(ep, k)]
+                for dist_k in dist_group:
+                    dist_item = dist_group[dist_k]
+                    if isinstance(dist_item, h5py.Dataset):
+                        if dist_k == "entity_names":
+                            raw = np.array(dist_item)
+                            names = [
+                                x.decode("utf-8") if isinstance(x, (bytes, np.bytes_)) else str(x)
+                                for x in raw
+                            ]
+                            print(
+                                "        distance key {} with shape {} values {}".format(
+                                    dist_k, dist_item.shape, names
+                                )
+                            )
+                        else:
+                            print(
+                                "        distance key {} with shape {}".format(
+                                    dist_k, dist_item.shape
+                                )
+                            )
+                if len(dist_group.attrs) > 0:
+                    print("        distance attrs {}".format(dict(dist_group.attrs)))
             elif isinstance(f["data/{}/{}".format(ep, k)], h5py.Dataset):
                 key_shape = f["data/{}/{}".format(ep, k)].shape
                 print("    key: {} with shape {}".format(k, key_shape))
