@@ -47,15 +47,27 @@ DEFAULT_AUTO_PUSH_CONFIG: Dict[str, Any] = {
     "pushes_per_episode": 4,
     "max_sampling_attempts": 80,
     "workspace_margin": 0.08,
-    "object_radius_fallback": 0.03,
+    "object_radius_fallback": 0.05,
+    "planning_radius_padding": 0.02,
     "ee_radius": 0.02,
     "contact_margin": 0.01,
-    "descent_extra_clearance": 0.04,
+    "descent_extra_clearance": 0.08,
+    "edge_direction_candidates": 12,
+    "edge_threshold_ratio": 0.72,
+    "edge_direction_noise_degrees": 20.0,
     "clearance_height": 0.15,
     "z_push_range": [0.015, 0.04],
     "z_push_limits": [0.01, 0.06],
+    "adaptive_z_push": {
+        "enabled": True,
+        "height_fraction_range": [0.20, 0.45],
+        "radius_fraction_range": [0.18, 0.45],
+        "min_offset": 0.008,
+        "max_offset": 0.045,
+    },
     "osc_kp": 5.0,
     "osc_max_delta": 0.03,
+    "episode_speed_scale_range": [0.75, 1.35],
     "pos_tolerance": 0.005,
     "max_steps_per_waypoint": 80,
     "push_waypoints": 8,
@@ -63,13 +75,13 @@ DEFAULT_AUTO_PUSH_CONFIG: Dict[str, Any] = {
     "settle_steps": 5,
     "boundary_threshold_ratio": 0.72,
     "target_sampling_weights": {
-        "nearest_neighbor": 0.60,
+        "nearest_neighbor": 0.50,
         "least_pushed": 0.25,
-        "uniform": 0.15,
+        "uniform": 0.25,
     },
     "push_type_weights": {
-        "object_to_object": 0.40,
-        "random_free": 0.20,
+        "object_to_object": 0.30,
+        "random_free": 0.30,
         "grazing": 0.15,
         "cluster": 0.15,
         "boundary_recovery": 0.05,
@@ -95,8 +107,25 @@ DEFAULT_AUTO_PUSH_CONFIG: Dict[str, Any] = {
         "near_miss_abs": [1.1, 1.5],
     },
     "angle_noise_degrees": {
-        "object_to_object": 20.0,
-        "cluster": 15.0,
+        "object_to_object": 30.0,
+        "cluster": 30.0,
+    },
+    "quality_filter": {
+        "enabled": True,
+        "no_contact_keep_probability": 0.03,
+        "weak_contact_keep_probability": 0.15,
+        "object_object_small_motion_keep_probability": 0.25,
+        "min_keep_displacement": 0.02,
+        "min_keep_rotation_deg": 10.0,
+        "moved_object_displacement": 0.012,
+        "moved_object_rotation_deg": 8.0,
+        "significant_displacement": 0.04,
+        "significant_rotation_deg": 15.0,
+        "min_eef_object_contacts": 2,
+        "max_object_z_delta": 0.05,
+        "max_object_z_lift_during_episode": 0.035,
+        "leave_table_margin": 0.02,
+        "max_robot_table_contacts": 15,
     },
 }
 
@@ -130,6 +159,17 @@ class AutoPushParams:
     end_xy: np.ndarray
     z_push: float
     gripper_cmd: float
+
+
+@dataclass
+class AutoEpisodeMetrics:
+    initial_pos: Dict[str, np.ndarray]
+    initial_quat: Dict[str, np.ndarray]
+    max_z_lift: Dict[str, float]
+    eef_object_contacts: int = 0
+    object_object_contacts: int = 0
+    robot_table_contacts: int = 0
+    leaves_table: bool = False
 
 
 @dataclass
@@ -572,6 +612,7 @@ def _validate_auto_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "push_waypoints",
         "push_steps_per_waypoint",
         "settle_steps",
+        "edge_direction_candidates",
     ):
         config[key] = int(config[key])
         if config[key] < 0:
@@ -579,9 +620,12 @@ def _validate_auto_config(config: Dict[str, Any]) -> Dict[str, Any]:
     for key in (
         "workspace_margin",
         "object_radius_fallback",
+        "planning_radius_padding",
         "ee_radius",
         "contact_margin",
         "descent_extra_clearance",
+        "edge_threshold_ratio",
+        "edge_direction_noise_degrees",
         "clearance_height",
         "osc_kp",
         "osc_max_delta",
@@ -599,6 +643,62 @@ def _validate_auto_config(config: Dict[str, Any]) -> Dict[str, Any]:
         raise RuntimeError("Auto config field 'max_steps_per_waypoint' must be positive.")
     if config["push_waypoints"] <= 0:
         raise RuntimeError("Auto config field 'push_waypoints' must be positive.")
+    if len(config.get("episode_speed_scale_range", [])) != 2:
+        raise RuntimeError("Auto config field 'episode_speed_scale_range' must be a [min, max] range.")
+    lo, hi = float(config["episode_speed_scale_range"][0]), float(config["episode_speed_scale_range"][1])
+    if lo <= 0.0 or hi <= 0.0:
+        raise RuntimeError("Auto config field 'episode_speed_scale_range' must contain positive values.")
+    config["episode_speed_scale_range"] = [min(lo, hi), max(lo, hi)]
+    qcfg = config.get("quality_filter", {})
+    if not isinstance(qcfg, dict):
+        raise RuntimeError("Auto config field 'quality_filter' must be an object.")
+    qcfg["enabled"] = bool(qcfg.get("enabled", True))
+    for key in (
+        "no_contact_keep_probability",
+        "weak_contact_keep_probability",
+        "object_object_small_motion_keep_probability",
+        "min_keep_displacement",
+        "min_keep_rotation_deg",
+        "moved_object_displacement",
+        "moved_object_rotation_deg",
+        "significant_displacement",
+        "significant_rotation_deg",
+        "max_object_z_delta",
+        "max_object_z_lift_during_episode",
+        "leave_table_margin",
+    ):
+        qcfg[key] = float(qcfg[key])
+        if qcfg[key] < 0.0:
+            raise RuntimeError(f"Auto config quality_filter field {key!r} must be non-negative.")
+    for key in (
+        "no_contact_keep_probability",
+        "weak_contact_keep_probability",
+        "object_object_small_motion_keep_probability",
+    ):
+        qcfg[key] = float(np.clip(qcfg[key], 0.0, 1.0))
+    qcfg["min_eef_object_contacts"] = int(qcfg["min_eef_object_contacts"])
+    qcfg["max_robot_table_contacts"] = int(qcfg["max_robot_table_contacts"])
+    if qcfg["min_eef_object_contacts"] < 0 or qcfg["max_robot_table_contacts"] < 0:
+        raise RuntimeError("Auto config quality_filter contact count thresholds must be non-negative.")
+    config["quality_filter"] = qcfg
+    zcfg = config.get("adaptive_z_push", {})
+    if not isinstance(zcfg, dict):
+        raise RuntimeError("Auto config field 'adaptive_z_push' must be an object.")
+    zcfg["enabled"] = bool(zcfg.get("enabled", True))
+    for key in ("height_fraction_range", "radius_fraction_range"):
+        if len(zcfg.get(key, [])) != 2:
+            raise RuntimeError(f"Auto config adaptive_z_push field {key!r} must be a [min, max] range.")
+        lo, hi = float(zcfg[key][0]), float(zcfg[key][1])
+        if lo < 0.0 or hi < 0.0:
+            raise RuntimeError(f"Auto config adaptive_z_push field {key!r} must be non-negative.")
+        zcfg[key] = [min(lo, hi), max(lo, hi)]
+    for key in ("min_offset", "max_offset"):
+        zcfg[key] = float(zcfg[key])
+        if zcfg[key] < 0.0:
+            raise RuntimeError(f"Auto config adaptive_z_push field {key!r} must be non-negative.")
+    if zcfg["max_offset"] < zcfg["min_offset"]:
+        zcfg["min_offset"], zcfg["max_offset"] = zcfg["max_offset"], zcfg["min_offset"]
+    config["adaptive_z_push"] = zcfg
     return config
 
 
@@ -702,6 +802,12 @@ def _workspace_bounds(env, config: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarr
     return lower.astype(np.float64), upper.astype(np.float64)
 
 
+def _table_xy_bounds(env, extra_margin: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
+    center = _workspace_center(env)
+    half_size = 0.5 * _table_full_size(env) + float(extra_margin)
+    return (center - half_size).astype(np.float64), (center + half_size).astype(np.float64)
+
+
 def _in_workspace(xy: np.ndarray, lower: np.ndarray, upper: np.ndarray) -> bool:
     xy = np.asarray(xy, dtype=np.float64).reshape(2)
     return bool(np.all(xy >= lower) and np.all(xy <= upper))
@@ -786,6 +892,191 @@ def _get_auto_object_states(env, config: Dict[str, Any]) -> List[AutoObjectState
     return objects
 
 
+def _body_geom_ids(env, body_id: int) -> List[int]:
+    model = env.sim.model
+    body_ids = set(_collect_body_subtree_ids(model, int(body_id)))
+    geom_bodyid = np.asarray(getattr(model, "geom_bodyid", []), dtype=np.int64).reshape(-1)
+    return [int(i) for i, bid in enumerate(geom_bodyid) if int(bid) in body_ids]
+
+
+def _geom_name(model, geom_id: int) -> str:
+    try:
+        name = model.geom_id2name(int(geom_id))
+    except Exception:
+        name = None
+    return "" if name is None else str(name)
+
+
+def _build_auto_contact_groups(env) -> Tuple[Dict[int, str], set, set, set]:
+    model = env.sim.model
+    obj_body_id = getattr(env, "obj_body_id", {}) or {}
+    objects_dict = getattr(env, "objects_dict", {}) or {}
+
+    object_geom_to_name: Dict[int, str] = {}
+    for name in objects_dict.keys():
+        if name not in obj_body_id:
+            continue
+        for gid in _body_geom_ids(env, int(obj_body_id[name])):
+            object_geom_to_name[int(gid)] = str(name)
+
+    gripper_geom_ids = set()
+    robot_geom_ids = set()
+    table_geom_ids = set()
+    for gid in range(int(model.ngeom)):
+        name = _geom_name(model, gid).lower()
+        if name.startswith("gripper0_") or "finger" in name or "hand" in name:
+            gripper_geom_ids.add(int(gid))
+            robot_geom_ids.add(int(gid))
+        elif name.startswith("robot0_") or "panda" in name:
+            robot_geom_ids.add(int(gid))
+        if "table" in name or "countertop" in name:
+            table_geom_ids.add(int(gid))
+    return object_geom_to_name, gripper_geom_ids, robot_geom_ids, table_geom_ids
+
+
+def _start_auto_episode_metrics(env, config: Dict[str, Any]) -> AutoEpisodeMetrics:
+    objects = _get_auto_object_states(env, config)
+    return AutoEpisodeMetrics(
+        initial_pos={obj.name: obj.pos.copy() for obj in objects},
+        initial_quat={obj.name: _normalize_quat_wxyz(obj.quat_wxyz).astype(np.float64) for obj in objects},
+        max_z_lift={obj.name: 0.0 for obj in objects},
+    )
+
+
+def _update_auto_episode_metrics(
+    env,
+    metrics: AutoEpisodeMetrics,
+    config: Dict[str, Any],
+    contact_groups: Tuple[Dict[int, str], set, set, set],
+) -> None:
+    object_geom_to_name, gripper_geom_ids, robot_geom_ids, table_geom_ids = contact_groups
+    data = env.sim.data
+    for idx in range(int(getattr(data, "ncon", 0))):
+        contact = data.contact[idx]
+        g1, g2 = int(contact.geom1), int(contact.geom2)
+        o1, o2 = object_geom_to_name.get(g1), object_geom_to_name.get(g2)
+        if (g1 in gripper_geom_ids and o2 is not None) or (g2 in gripper_geom_ids and o1 is not None):
+            metrics.eef_object_contacts += 1
+        if o1 is not None and o2 is not None and o1 != o2:
+            metrics.object_object_contacts += 1
+        if (g1 in robot_geom_ids and g2 in table_geom_ids) or (g2 in robot_geom_ids and g1 in table_geom_ids):
+            metrics.robot_table_contacts += 1
+
+    lower, upper = _table_xy_bounds(env, extra_margin=float(config["quality_filter"]["leave_table_margin"]))
+    table_z = _table_height(env)
+    for obj in _get_auto_object_states(env, config):
+        if obj.name in metrics.initial_pos:
+            z_lift = float(obj.pos[2] - metrics.initial_pos[obj.name][2])
+            metrics.max_z_lift[obj.name] = max(float(metrics.max_z_lift.get(obj.name, 0.0)), z_lift)
+        if not _in_workspace(obj.xy, lower, upper) or obj.pos[2] < table_z - 0.08:
+            metrics.leaves_table = True
+
+
+def _quat_angle_delta_deg(q0_wxyz: np.ndarray, q1_wxyz: np.ndarray) -> float:
+    q0 = _normalize_quat_wxyz(np.asarray(q0_wxyz, dtype=np.float64))
+    q1 = _normalize_quat_wxyz(np.asarray(q1_wxyz, dtype=np.float64))
+    dot = float(abs(np.dot(q0, q1)))
+    dot = float(np.clip(dot, -1.0, 1.0))
+    return float(np.rad2deg(2.0 * np.arccos(dot)))
+
+
+def _summarize_auto_episode_metrics(env, metrics: AutoEpisodeMetrics, config: Dict[str, Any]) -> Dict[str, Any]:
+    final_objects = {obj.name: obj for obj in _get_auto_object_states(env, config)}
+    displacements: Dict[str, float] = {}
+    z_deltas: Dict[str, float] = {}
+    rotations: Dict[str, float] = {}
+    moved_objects = 0
+    for name, initial_pos in metrics.initial_pos.items():
+        obj = final_objects.get(name)
+        if obj is None:
+            continue
+        disp = float(np.linalg.norm(obj.pos[:2] - initial_pos[:2]))
+        z_delta = float(obj.pos[2] - initial_pos[2])
+        rot_delta = _quat_angle_delta_deg(metrics.initial_quat[name], obj.quat_wxyz)
+        displacements[name] = disp
+        z_deltas[name] = z_delta
+        rotations[name] = rot_delta
+        if (
+            disp >= float(config["quality_filter"]["moved_object_displacement"])
+            or rot_delta >= float(config["quality_filter"]["moved_object_rotation_deg"])
+        ):
+            moved_objects += 1
+
+    return {
+        "eef_object_contacts": int(metrics.eef_object_contacts),
+        "object_object_contacts": int(metrics.object_object_contacts),
+        "robot_table_contacts": int(metrics.robot_table_contacts),
+        "leaves_table": bool(metrics.leaves_table),
+        "max_object_displacement": float(max(displacements.values()) if displacements else 0.0),
+        "max_abs_object_z_delta": float(max((abs(v) for v in z_deltas.values()), default=0.0)),
+        "max_object_z_lift_during_episode": float(max(metrics.max_z_lift.values()) if metrics.max_z_lift else 0.0),
+        "max_object_rotation_deg": float(max(rotations.values()) if rotations else 0.0),
+        "moved_objects": int(moved_objects),
+        "object_displacements": displacements,
+        "object_z_deltas": z_deltas,
+        "object_rotation_deg": rotations,
+    }
+
+
+def _evaluate_auto_episode_quality(
+    env,
+    metrics: AutoEpisodeMetrics,
+    config: Dict[str, Any],
+    rng: np.random.Generator,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    summary = _summarize_auto_episode_metrics(env, metrics, config)
+    qcfg = config["quality_filter"]
+    if not bool(qcfg.get("enabled", True)):
+        summary["decision_reason"] = "filter_disabled"
+        return True, "unfiltered", summary
+
+    if summary["leaves_table"]:
+        summary["decision_reason"] = "object_left_table"
+        return False, "reject_left_table", summary
+    if summary["max_abs_object_z_delta"] > float(qcfg["max_object_z_delta"]):
+        summary["decision_reason"] = "object_z_delta_too_large"
+        return False, "reject_lifted_object", summary
+    if summary["max_object_z_lift_during_episode"] > float(qcfg["max_object_z_lift_during_episode"]):
+        summary["decision_reason"] = "object_lifted_during_episode"
+        return False, "reject_lifted_object", summary
+    if summary["robot_table_contacts"] > int(qcfg["max_robot_table_contacts"]):
+        summary["decision_reason"] = "robot_table_collision"
+        return False, "reject_robot_table", summary
+
+    has_eef_contact = int(summary["eef_object_contacts"]) >= int(qcfg["min_eef_object_contacts"])
+    has_any_eef_contact = int(summary["eef_object_contacts"]) > 0
+    has_object_contact = int(summary["object_object_contacts"]) > 0
+    max_disp = float(summary["max_object_displacement"])
+    max_rot = float(summary["max_object_rotation_deg"])
+    has_keep_motion = (
+        max_disp >= float(qcfg["min_keep_displacement"])
+        or max_rot >= float(qcfg["min_keep_rotation_deg"])
+        or int(summary["moved_objects"]) > 0
+    )
+
+    if not has_any_eef_contact and not has_object_contact:
+        keep = float(rng.uniform()) < float(qcfg["no_contact_keep_probability"])
+        summary["decision_reason"] = "no_contact_sampled" if keep else "no_contact_dropped"
+        return keep, "no_contact", summary
+    if has_object_contact:
+        if has_keep_motion:
+            summary["decision_reason"] = "object_object_contact"
+            return True, "object_object", summary
+        keep = float(rng.uniform()) < float(qcfg["object_object_small_motion_keep_probability"])
+        summary["decision_reason"] = "object_object_small_motion_sampled" if keep else "object_object_small_motion_dropped"
+        return keep, "object_object_small_motion", summary
+    if max_disp >= float(qcfg["significant_displacement"]) or max_rot >= float(qcfg["significant_rotation_deg"]):
+        summary["decision_reason"] = "significant_motion"
+        return True, "significant_motion", summary
+    if has_eef_contact and has_keep_motion:
+        summary["decision_reason"] = "eef_contact_motion"
+        return True, "eef_contact_motion", summary
+
+    keep = float(rng.uniform()) < float(qcfg["weak_contact_keep_probability"])
+    summary["decision_reason"] = "weak_contact_sampled" if keep else "weak_contact_dropped"
+    return keep, "weak_contact", summary
+
+
 def _valid_auto_objects(env, config: Dict[str, Any]) -> List[AutoObjectState]:
     table_z = _table_height(env)
     lower, upper = _workspace_bounds(env, config)
@@ -855,10 +1146,35 @@ def _sample_push_direction(
         noise = _sample_uniform_range([-config["angle_noise_degrees"]["cluster"], config["angle_noise_degrees"]["cluster"]], rng)
         direction = None if direction is None else _unit_vector(_rotate_xy(direction, noise))
     elif push_type == "boundary_recovery":
-        direction = _unit_vector(np.asarray(workspace_center, dtype=np.float64).reshape(2) - target.xy)
+        outward = _unit_vector(target.xy - np.asarray(workspace_center, dtype=np.float64).reshape(2))
+        if outward is None:
+            return _random_unit_vector(rng)
+        num_candidates = max(1, int(config["edge_direction_candidates"]))
+        candidate_angles = np.linspace(-90.0, 90.0, num_candidates)
+        base_angle = float(candidate_angles[int(rng.integers(0, len(candidate_angles)))])
+        noise = _sample_uniform_range(
+            [-config["edge_direction_noise_degrees"], config["edge_direction_noise_degrees"]],
+            rng,
+        )
+        direction = _unit_vector(_rotate_xy(outward, base_angle + noise))
     else:
         direction = _random_unit_vector(rng)
     return direction
+
+
+def _sample_z_push_offset(target: AutoObjectState, config: Dict[str, Any], rng: np.random.Generator) -> float:
+    zcfg = config.get("adaptive_z_push", {})
+    if not bool(zcfg.get("enabled", False)):
+        return _sample_uniform_range(config["z_push_range"], rng)
+
+    height = max(float(target.height), 1e-6)
+    radius = max(float(target.radius), float(config["object_radius_fallback"]))
+    h_frac = _sample_uniform_range(zcfg["height_fraction_range"], rng)
+    r_frac = _sample_uniform_range(zcfg["radius_fraction_range"], rng)
+    height_offset = h_frac * height
+    radius_offset = r_frac * radius
+    offset = min(height_offset, radius_offset)
+    return float(np.clip(offset, float(zcfg["min_offset"]), float(zcfg["max_offset"])))
 
 
 def _compute_auto_push_params(
@@ -882,19 +1198,20 @@ def _compute_auto_push_params(
         return None
     normal = np.asarray([-direction[1], direction[0]], dtype=np.float64)
     obj_radius = max(float(target.radius), float(config["object_radius_fallback"]))
+    planning_radius = obj_radius + float(config["planning_radius_padding"])
     if push_type == "grazing":
-        lateral_abs = _sample_uniform_range(config["lateral_offset_ranges"]["grazing_abs"], rng) * obj_radius
+        lateral_abs = _sample_uniform_range(config["lateral_offset_ranges"]["grazing_abs"], rng) * planning_radius
         lateral_offset = float(lateral_abs * rng.choice([-1.0, 1.0]))
     elif push_type == "near_miss_or_weak":
-        lateral_abs = _sample_uniform_range(config["lateral_offset_ranges"]["near_miss_abs"], rng) * obj_radius
+        lateral_abs = _sample_uniform_range(config["lateral_offset_ranges"]["near_miss_abs"], rng) * planning_radius
         lateral_offset = float(lateral_abs * rng.choice([-1.0, 1.0]))
     else:
         lo_hi = config["lateral_offset_ranges"]["default"]
-        lateral_offset = _sample_uniform_range([float(lo_hi[0]) * obj_radius, float(lo_hi[1]) * obj_radius], rng)
+        lateral_offset = _sample_uniform_range([float(lo_hi[0]) * planning_radius, float(lo_hi[1]) * planning_radius], rng)
 
     length_key = "weak" if push_type == "near_miss_or_weak" and float(rng.uniform()) < 0.5 else "default"
     push_length = _sample_uniform_range(config["push_length_ranges"][length_key], rng)
-    start_xy = target.xy - (obj_radius + float(config["ee_radius"]) + float(config["contact_margin"])) * direction
+    start_xy = target.xy - (planning_radius + float(config["ee_radius"]) + float(config["contact_margin"])) * direction
     start_xy = start_xy + lateral_offset * normal
     approach_xy = start_xy - float(config["descent_extra_clearance"]) * direction
     end_xy = start_xy + push_length * direction
@@ -906,7 +1223,7 @@ def _compute_auto_push_params(
         return None
 
     table_z = _table_height(env)
-    z_push = table_z + _sample_uniform_range(config["z_push_range"], rng)
+    z_push = table_z + _sample_z_push_offset(target, config, rng)
     z_limits = config["z_push_limits"]
     z_push = float(np.clip(z_push, table_z + float(z_limits[0]), table_z + float(z_limits[1])))
     gripper_mode = _weighted_choice(config["gripper_weights"], rng)
@@ -928,14 +1245,15 @@ def _auto_delta_action_to_target(
     gripper_cmd: float,
     config: Dict[str, Any],
     controller_cfg: dict,
+    speed_scale: float,
 ) -> Tuple[np.ndarray, float]:
     current_pose = _snapshot_controller_ee_pose(env)
     target_pos = np.asarray(target_pos, dtype=np.float32).reshape(3)
     pos_scale, _rot_scale = _controller_output_scales(controller_cfg)
     delta_pos = target_pos - current_pose[:3]
     distance = float(np.linalg.norm(delta_pos))
-    kp = float(config["osc_kp"])
-    max_delta = float(config["osc_max_delta"])
+    kp = float(config["osc_kp"]) * float(speed_scale)
+    max_delta = float(config["osc_max_delta"]) * float(speed_scale)
     delta_pos_cmd_m = np.clip(kp * delta_pos, -max_delta, max_delta)
     delta_pos_cmd = np.clip(delta_pos_cmd_m / pos_scale, -1.0, 1.0).astype(np.float32, copy=False)
     action_dim = int(getattr(env, "action_dim", 0))
@@ -960,6 +1278,9 @@ def _auto_move_ee_to(
     buffer: EpisodeBuffer,
     config: Dict[str, Any],
     controller_cfg: dict,
+    speed_scale: float,
+    metrics: AutoEpisodeMetrics,
+    contact_groups: Tuple[Dict[int, str], set, set, set],
     max_total_steps: int,
     max_steps: Optional[int] = None,
     render: bool = False,
@@ -974,19 +1295,24 @@ def _auto_move_ee_to(
             gripper_cmd,
             config,
             controller_cfg,
+            speed_scale,
         )
         if distance <= float(config["pos_tolerance"]):
             return True
         _record_step(env, action, buffer)
+        _update_auto_episode_metrics(env, metrics, config, contact_groups)
         if render:
             env.render()
-    return True
+    return False
 
 
 def _auto_record_settle_steps(
     env,
     gripper_cmd: float,
     buffer: EpisodeBuffer,
+    metrics: AutoEpisodeMetrics,
+    contact_groups: Tuple[Dict[int, str], set, set, set],
+    config: Dict[str, Any],
     max_total_steps: int,
     settle_steps: int,
     render: bool = False,
@@ -999,6 +1325,7 @@ def _auto_record_settle_steps(
         if buffer.num_steps >= int(max_total_steps):
             return
         _record_step(env, action, buffer)
+        _update_auto_episode_metrics(env, metrics, config, contact_groups)
         if render:
             env.render()
 
@@ -1009,6 +1336,9 @@ def _execute_auto_push(
     buffer: EpisodeBuffer,
     config: Dict[str, Any],
     controller_cfg: dict,
+    speed_scale: float,
+    metrics: AutoEpisodeMetrics,
+    contact_groups: Tuple[Dict[int, str], set, set, set],
     max_total_steps: int,
     render: bool = False,
 ) -> None:
@@ -1022,78 +1352,105 @@ def _execute_auto_push(
     end_push = np.asarray([params.end_xy[0], params.end_xy[1], params.z_push], dtype=np.float32)
     end_clear = np.asarray([params.end_xy[0], params.end_xy[1], clear_z], dtype=np.float32)
 
-    _auto_move_ee_to(
+    if not _auto_move_ee_to(
         env,
         current_clear,
         params.gripper_cmd,
         buffer,
         config,
         controller_cfg,
+        speed_scale,
+        metrics,
+        contact_groups,
         max_total_steps,
         render=render,
-    )
-    _auto_move_ee_to(
+    ):
+        return
+    if not _auto_move_ee_to(
         env,
         approach_clear,
         params.gripper_cmd,
         buffer,
         config,
         controller_cfg,
+        speed_scale,
+        metrics,
+        contact_groups,
         max_total_steps,
         render=render,
-    )
-    _auto_move_ee_to(
+    ):
+        return
+    if not _auto_move_ee_to(
         env,
         approach_push,
         params.gripper_cmd,
         buffer,
         config,
         controller_cfg,
+        speed_scale,
+        metrics,
+        contact_groups,
         max_total_steps,
         render=render,
-    )
-    _auto_move_ee_to(
+    ):
+        return
+    if not _auto_move_ee_to(
         env,
         start_push,
         params.gripper_cmd,
         buffer,
         config,
         controller_cfg,
+        speed_scale,
+        metrics,
+        contact_groups,
         max_total_steps,
         render=render,
-    )
+    ):
+        return
     if buffer.num_steps >= int(max_total_steps):
         return
 
     for alpha in np.linspace(0.0, 1.0, int(config["push_waypoints"])):
         target_pos = ((1.0 - float(alpha)) * start_push + float(alpha) * end_push).astype(np.float32, copy=False)
-        _auto_move_ee_to(
+        if not _auto_move_ee_to(
             env,
             target_pos,
             params.gripper_cmd,
             buffer,
             config,
             controller_cfg,
+            speed_scale,
+            metrics,
+            contact_groups,
             max_total_steps,
             max_steps=int(config["push_steps_per_waypoint"]),
             render=render,
-        )
+        ):
+            return
         if buffer.num_steps >= int(max_total_steps):
             return
-    _auto_move_ee_to(
+    if not _auto_move_ee_to(
         env,
         end_clear,
         params.gripper_cmd,
         buffer,
         config,
         controller_cfg,
+        speed_scale,
+        metrics,
+        contact_groups,
         max_total_steps,
         render=render,
-    )
+    ):
+        return
     _auto_record_settle_steps(
         env,
         params.gripper_cmd,
         buffer,
+        metrics,
+        contact_groups,
+        config,
         max_total_steps=max_total_steps,
         settle_steps=int(config["settle_steps"]),
         render=render,
@@ -1464,6 +1821,9 @@ def _run_auto_collection(
             _install_dual_camera_viewer(env, args)
             env.render()
         buffer = EpisodeBuffer.start(env)
+        metrics = _start_auto_episode_metrics(env, config)
+        contact_groups = _build_auto_contact_groups(env)
+        episode_speed_scale = _sample_uniform_range(config["episode_speed_scale_range"], rng)
         primitive_idx = 0
         attempts = 0
         while primitive_idx < int(config["pushes_per_episode"]) and buffer.num_steps < int(args.max_steps):
@@ -1484,7 +1844,8 @@ def _run_auto_collection(
             before_steps = buffer.num_steps
             print(
                 f"[AUTO] push={primitive_idx + 1}/{int(config['pushes_per_episode'])} "
-                f"type={params.push_type} target={params.target_name} steps={buffer.num_steps}"
+                f"type={params.push_type} target={params.target_name} "
+                f"speed={episode_speed_scale:.2f} steps={buffer.num_steps}"
             )
             _execute_auto_push(
                 env,
@@ -1492,6 +1853,9 @@ def _run_auto_collection(
                 buffer,
                 config,
                 controller_cfg,
+                episode_speed_scale,
+                metrics,
+                contact_groups,
                 max_total_steps=int(args.max_steps),
                 render=not bool(args.no_render),
             )
@@ -1508,10 +1872,33 @@ def _run_auto_collection(
             print("[AUTO] empty episode discarded")
             continue
 
+        keep, quality_category, quality_summary = _evaluate_auto_episode_quality(env, metrics, config, rng)
+        if not keep:
+            discarded += 1
+            print(
+                f"[AUTO-DISCARD] category={quality_category} reason={quality_summary.get('decision_reason')} "
+                f"eef_obj={quality_summary['eef_object_contacts']} obj_obj={quality_summary['object_object_contacts']} "
+                f"moved={quality_summary['moved_objects']} max_disp={quality_summary['max_object_displacement']:.4f} "
+                f"max_rot={quality_summary['max_object_rotation_deg']:.2f} "
+                f"max_z={quality_summary['max_abs_object_z_delta']:.4f} robot_table={quality_summary['robot_table_contacts']}"
+            )
+            continue
+
         empty_resets = 0
-        demo_key, last_len = _append_episode(output_path, buffer)
+        episode_attrs = {
+            "collection_mode": "auto",
+            "auto_quality_category": quality_category,
+            "auto_quality_metrics": quality_summary,
+            "auto_episode_speed_scale": float(episode_speed_scale),
+        }
+        demo_key, last_len = _append_episode(output_path, buffer, episode_attrs=episode_attrs)
         saved += 1
-        print(f"[SAVED] {demo_key} len={last_len} mode=auto")
+        print(
+            f"[SAVED] {demo_key} len={last_len} mode=auto quality={quality_category} "
+            f"eef_obj={quality_summary['eef_object_contacts']} obj_obj={quality_summary['object_object_contacts']} "
+            f"moved={quality_summary['moved_objects']} max_disp={quality_summary['max_object_displacement']:.4f} "
+            f"max_rot={quality_summary['max_object_rotation_deg']:.2f}"
+        )
         _print_status(
             phase="AUTO",
             saved=saved,
