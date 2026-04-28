@@ -11,7 +11,7 @@ import tty
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import h5py
 import numpy as np
@@ -43,11 +43,93 @@ DEFAULT_SOURCE = (
 )
 
 
+DEFAULT_AUTO_PUSH_CONFIG: Dict[str, Any] = {
+    "pushes_per_episode": 4,
+    "max_sampling_attempts": 80,
+    "workspace_margin": 0.08,
+    "object_radius_fallback": 0.03,
+    "ee_radius": 0.02,
+    "contact_margin": 0.01,
+    "descent_extra_clearance": 0.04,
+    "clearance_height": 0.15,
+    "z_push_range": [0.015, 0.04],
+    "z_push_limits": [0.01, 0.06],
+    "osc_kp": 5.0,
+    "osc_max_delta": 0.03,
+    "pos_tolerance": 0.005,
+    "max_steps_per_waypoint": 80,
+    "push_waypoints": 8,
+    "push_steps_per_waypoint": 20,
+    "settle_steps": 5,
+    "boundary_threshold_ratio": 0.72,
+    "target_sampling_weights": {
+        "nearest_neighbor": 0.60,
+        "least_pushed": 0.25,
+        "uniform": 0.15,
+    },
+    "push_type_weights": {
+        "object_to_object": 0.40,
+        "random_free": 0.20,
+        "grazing": 0.15,
+        "cluster": 0.15,
+        "boundary_recovery": 0.05,
+        "near_miss_or_weak": 0.05,
+    },
+    "gripper_weights": {
+        "closed": 0.50,
+        "half_open": 0.30,
+        "open": 0.20,
+    },
+    "gripper_commands": {
+        "closed": -1.0,
+        "half_open": 0.0,
+        "open": 1.0,
+    },
+    "push_length_ranges": {
+        "default": [0.08, 0.20],
+        "weak": [0.03, 0.07],
+    },
+    "lateral_offset_ranges": {
+        "default": [-0.5, 0.5],
+        "grazing_abs": [0.5, 0.9],
+        "near_miss_abs": [1.1, 1.5],
+    },
+    "angle_noise_degrees": {
+        "object_to_object": 20.0,
+        "cluster": 15.0,
+    },
+}
+
+
 @dataclass(frozen=True)
 class EpisodeSeed:
     demo_key: str
     model_xml: Optional[str]
     init_state: Optional[np.ndarray]
+
+
+@dataclass(frozen=True)
+class AutoObjectState:
+    name: str
+    pos: np.ndarray
+    quat_wxyz: np.ndarray
+    radius: float
+    height: float
+
+    @property
+    def xy(self) -> np.ndarray:
+        return self.pos[:2]
+
+
+@dataclass(frozen=True)
+class AutoPushParams:
+    target_name: str
+    push_type: str
+    approach_xy: np.ndarray
+    start_xy: np.ndarray
+    end_xy: np.ndarray
+    z_push: float
+    gripper_cmd: float
 
 
 @dataclass
@@ -452,6 +534,572 @@ def find_bddl_file(bddl_file_name: str) -> Optional[str]:
     return str(best_path) if best_path is not None else None
 
 
+def _deep_copy_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    return json.loads(json.dumps(config))
+
+
+def _deep_update_config(base: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
+    for key, value in update.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _deep_update_config(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def _normalize_weight_dict(config: Dict[str, Any], key: str) -> Dict[str, float]:
+    raw = config.get(key, {})
+    if not isinstance(raw, dict) or not raw:
+        raise RuntimeError(f"Auto config field {key!r} must be a non-empty object.")
+    weights = {str(k): float(v) for k, v in raw.items()}
+    if any(v < 0.0 for v in weights.values()):
+        raise RuntimeError(f"Auto config field {key!r} contains negative weights: {weights}")
+    total = float(sum(weights.values()))
+    if total <= 0.0:
+        raise RuntimeError(f"Auto config field {key!r} must have positive total weight.")
+    return {k: v / total for k, v in weights.items()}
+
+
+def _validate_auto_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    config = _deep_copy_config(config)
+    config["target_sampling_weights"] = _normalize_weight_dict(config, "target_sampling_weights")
+    config["push_type_weights"] = _normalize_weight_dict(config, "push_type_weights")
+    config["gripper_weights"] = _normalize_weight_dict(config, "gripper_weights")
+    for key in (
+        "pushes_per_episode",
+        "max_sampling_attempts",
+        "max_steps_per_waypoint",
+        "push_waypoints",
+        "push_steps_per_waypoint",
+        "settle_steps",
+    ):
+        config[key] = int(config[key])
+        if config[key] < 0:
+            raise RuntimeError(f"Auto config field {key!r} must be non-negative.")
+    for key in (
+        "workspace_margin",
+        "object_radius_fallback",
+        "ee_radius",
+        "contact_margin",
+        "descent_extra_clearance",
+        "clearance_height",
+        "osc_kp",
+        "osc_max_delta",
+        "pos_tolerance",
+        "boundary_threshold_ratio",
+    ):
+        config[key] = float(config[key])
+        if config[key] < 0.0:
+            raise RuntimeError(f"Auto config field {key!r} must be non-negative.")
+    if config["pushes_per_episode"] <= 0:
+        raise RuntimeError("Auto config field 'pushes_per_episode' must be positive.")
+    if config["max_sampling_attempts"] <= 0:
+        raise RuntimeError("Auto config field 'max_sampling_attempts' must be positive.")
+    if config["max_steps_per_waypoint"] <= 0:
+        raise RuntimeError("Auto config field 'max_steps_per_waypoint' must be positive.")
+    if config["push_waypoints"] <= 0:
+        raise RuntimeError("Auto config field 'push_waypoints' must be positive.")
+    return config
+
+
+def _load_auto_config(path: Optional[str]) -> Dict[str, Any]:
+    config = _deep_copy_config(DEFAULT_AUTO_PUSH_CONFIG)
+    if path:
+        config_path = Path(path).expanduser().resolve()
+        with config_path.open("r", encoding="utf-8") as f:
+            user_config = json.load(f)
+        if not isinstance(user_config, dict):
+            raise RuntimeError(f"Auto config must be a JSON object: {config_path}")
+        _deep_update_config(config, user_config)
+    return _validate_auto_config(config)
+
+
+def _dump_auto_config(path: str) -> None:
+    config_path = Path(path).expanduser().resolve()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with config_path.open("w", encoding="utf-8") as f:
+        json.dump(DEFAULT_AUTO_PUSH_CONFIG, f, indent=2, sort_keys=True)
+        f.write("\n")
+    print(f"[INFO] wrote default auto config: {config_path}")
+
+
+def _weighted_choice(weights: Dict[str, float], rng: np.random.Generator) -> str:
+    keys = list(weights.keys())
+    probs = np.asarray([float(weights[k]) for k in keys], dtype=np.float64)
+    probs = probs / max(float(probs.sum()), 1e-12)
+    return str(keys[int(rng.choice(len(keys), p=probs))])
+
+
+def _sample_uniform_range(values: Sequence[float], rng: np.random.Generator) -> float:
+    if len(values) != 2:
+        raise RuntimeError(f"Expected a [min, max] range, got {values!r}")
+    lo, hi = float(values[0]), float(values[1])
+    if hi < lo:
+        lo, hi = hi, lo
+    return float(rng.uniform(lo, hi))
+
+
+def _unit_vector(vec: np.ndarray) -> Optional[np.ndarray]:
+    vec = np.asarray(vec, dtype=np.float64).reshape(2)
+    norm = float(np.linalg.norm(vec))
+    if norm <= 1e-8:
+        return None
+    return (vec / norm).astype(np.float64, copy=False)
+
+
+def _random_unit_vector(rng: np.random.Generator) -> np.ndarray:
+    theta = float(rng.uniform(0.0, 2.0 * np.pi))
+    return np.asarray([np.cos(theta), np.sin(theta)], dtype=np.float64)
+
+
+def _rotate_xy(vec: np.ndarray, degrees: float) -> np.ndarray:
+    rad = np.deg2rad(float(degrees))
+    c, s = float(np.cos(rad)), float(np.sin(rad))
+    rot = np.asarray([[c, -s], [s, c]], dtype=np.float64)
+    return rot @ np.asarray(vec, dtype=np.float64).reshape(2)
+
+
+def _table_full_size(env) -> np.ndarray:
+    for attr in (
+        "table_full_size",
+        "kitchen_table_full_size",
+        "study_table_full_size",
+        "coffee_table_full_size",
+        "living_room_table_full_size",
+    ):
+        if hasattr(env, attr):
+            value = np.asarray(getattr(env, attr), dtype=np.float64).reshape(-1)
+            if value.shape[0] >= 2:
+                return value[:2]
+    return np.asarray([1.0, 1.2], dtype=np.float64)
+
+
+def _workspace_center(env) -> np.ndarray:
+    offset = np.asarray(getattr(env, "workspace_offset", (0.0, 0.0, 0.9)), dtype=np.float64).reshape(-1)
+    if offset.shape[0] < 2:
+        return np.zeros(2, dtype=np.float64)
+    return offset[:2]
+
+
+def _table_height(env) -> float:
+    offset = np.asarray(getattr(env, "workspace_offset", (0.0, 0.0, 0.9)), dtype=np.float64).reshape(-1)
+    if offset.shape[0] >= 3:
+        return float(offset[2])
+    for attr in ("table_offset", "kitchen_table_offset", "study_table_offset", "coffee_table_offset", "living_room_table_offset"):
+        if hasattr(env, attr):
+            value = np.asarray(getattr(env, attr), dtype=np.float64).reshape(-1)
+            if value.shape[0] >= 3:
+                return float(value[2])
+    return 0.9
+
+
+def _workspace_bounds(env, config: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
+    center = _workspace_center(env)
+    half_size = 0.5 * _table_full_size(env)
+    margin = float(config["workspace_margin"])
+    lower = center - np.maximum(half_size - margin, 0.02)
+    upper = center + np.maximum(half_size - margin, 0.02)
+    return lower.astype(np.float64), upper.astype(np.float64)
+
+
+def _in_workspace(xy: np.ndarray, lower: np.ndarray, upper: np.ndarray) -> bool:
+    xy = np.asarray(xy, dtype=np.float64).reshape(2)
+    return bool(np.all(xy >= lower) and np.all(xy <= upper))
+
+
+def _collect_body_subtree_ids(model, root_body_id: int) -> List[int]:
+    body_parentid = np.asarray(getattr(model, "body_parentid", []), dtype=np.int64).reshape(-1)
+    if body_parentid.size == 0:
+        return [int(root_body_id)]
+    result = [int(root_body_id)]
+    queue = [int(root_body_id)]
+    while queue:
+        parent = queue.pop(0)
+        children = np.where(body_parentid == parent)[0].astype(int).tolist()
+        for child in children:
+            if child not in result:
+                result.append(child)
+                queue.append(child)
+    return result
+
+
+def _estimate_object_extent(env, body_id: int, fallback_radius: float) -> Tuple[float, float]:
+    model = env.sim.model
+    data = env.sim.data
+    body_ids = set(_collect_body_subtree_ids(model, int(body_id)))
+    geom_bodyid = np.asarray(getattr(model, "geom_bodyid", []), dtype=np.int64).reshape(-1)
+    if geom_bodyid.size == 0:
+        return float(fallback_radius), float(2.0 * fallback_radius)
+    geom_ids = [int(i) for i, bid in enumerate(geom_bodyid) if int(bid) in body_ids]
+    if not geom_ids:
+        return float(fallback_radius), float(2.0 * fallback_radius)
+    geom_group = np.asarray(getattr(model, "geom_group", np.zeros(len(geom_ids))), dtype=np.int64).reshape(-1)
+    collision_geom_ids = [gid for gid in geom_ids if geom_group.size <= gid or int(geom_group[gid]) == 0]
+    active_geom_ids = collision_geom_ids if collision_geom_ids else geom_ids
+
+    body_pos = np.asarray(data.body_xpos[int(body_id)], dtype=np.float64).reshape(3)
+    xy_radii = []
+    z_lows = []
+    z_highs = []
+    for gid in active_geom_ids:
+        geom_pos = np.asarray(data.geom_xpos[gid], dtype=np.float64).reshape(3)
+        size = np.asarray(model.geom_size[gid], dtype=np.float64).reshape(-1)
+        if size.size == 0:
+            radius_extent = float(fallback_radius)
+            z_extent = float(fallback_radius)
+        elif size.size == 1:
+            radius_extent = float(size[0])
+            z_extent = float(size[0])
+        else:
+            radius_extent = float(max(size[0], size[1] if size.size > 1 else size[0]))
+            z_extent = float(max(size[0], size[1], size[2] if size.size > 2 else size[0]))
+        xy_radii.append(float(np.linalg.norm(geom_pos[:2] - body_pos[:2])) + radius_extent)
+        z_lows.append(float(geom_pos[2] - z_extent))
+        z_highs.append(float(geom_pos[2] + z_extent))
+
+    radius = max(float(fallback_radius), max(xy_radii) if xy_radii else float(fallback_radius))
+    height = max(2.0 * float(fallback_radius), (max(z_highs) - min(z_lows)) if z_lows and z_highs else 0.0)
+    return float(radius), float(height)
+
+
+def _get_auto_object_states(env, config: Dict[str, Any]) -> List[AutoObjectState]:
+    objects: List[AutoObjectState] = []
+    obj_body_id = getattr(env, "obj_body_id", {}) or {}
+    objects_dict = getattr(env, "objects_dict", {}) or {}
+    fallback_radius = float(config["object_radius_fallback"])
+    for name in sorted(objects_dict.keys()):
+        if name not in obj_body_id:
+            continue
+        body_id = int(obj_body_id[name])
+        pos = np.asarray(env.sim.data.body_xpos[body_id], dtype=np.float64).reshape(3).copy()
+        quat = np.asarray(env.sim.data.body_xquat[body_id], dtype=np.float64).reshape(4).copy()
+        radius, height = _estimate_object_extent(env, body_id, fallback_radius)
+        objects.append(
+            AutoObjectState(
+                name=str(name),
+                pos=pos,
+                quat_wxyz=quat,
+                radius=float(radius),
+                height=float(height),
+            )
+        )
+    return objects
+
+
+def _valid_auto_objects(env, config: Dict[str, Any]) -> List[AutoObjectState]:
+    table_z = _table_height(env)
+    lower, upper = _workspace_bounds(env, config)
+    valid = []
+    for obj in _get_auto_object_states(env, config):
+        if not _in_workspace(obj.xy, lower, upper):
+            continue
+        if obj.pos[2] < table_z - 0.10 or obj.pos[2] > table_z + 0.25:
+            continue
+        valid.append(obj)
+    return valid
+
+
+def _softmax_sample(values: np.ndarray, rng: np.random.Generator, temperature: float = 1.0) -> int:
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if values.size <= 1:
+        return 0
+    scaled = values / max(float(temperature), 1e-8)
+    scaled -= float(np.max(scaled))
+    probs = np.exp(scaled)
+    probs /= max(float(probs.sum()), 1e-12)
+    return int(rng.choice(values.size, p=probs))
+
+
+def _select_target_object(
+    valid_objects: Sequence[AutoObjectState],
+    push_counts: Dict[str, int],
+    config: Dict[str, Any],
+    rng: np.random.Generator,
+) -> AutoObjectState:
+    if not valid_objects:
+        raise RuntimeError("No valid objects available for automatic pushing.")
+    mode = _weighted_choice(config["target_sampling_weights"], rng)
+    if mode == "nearest_neighbor" and len(valid_objects) > 1:
+        nearest_dists = []
+        for obj in valid_objects:
+            dists = [float(np.linalg.norm(obj.xy - other.xy)) for other in valid_objects if other.name != obj.name]
+            nearest_dists.append(min(dists) if dists else 1.0)
+        idx = _softmax_sample(-np.asarray(nearest_dists), rng, temperature=0.05)
+        return valid_objects[idx]
+    if mode == "least_pushed":
+        scores = -np.asarray([float(push_counts.get(obj.name, 0)) for obj in valid_objects], dtype=np.float64)
+        idx = _softmax_sample(scores, rng, temperature=1.0)
+        return valid_objects[idx]
+    return valid_objects[int(rng.integers(0, len(valid_objects)))]
+
+
+def _sample_push_direction(
+    target: AutoObjectState,
+    valid_objects: Sequence[AutoObjectState],
+    push_type: str,
+    workspace_center: np.ndarray,
+    config: Dict[str, Any],
+    rng: np.random.Generator,
+) -> Optional[np.ndarray]:
+    others = [obj for obj in valid_objects if obj.name != target.name]
+    direction: Optional[np.ndarray]
+    if push_type == "object_to_object" and others:
+        dists = np.asarray([np.linalg.norm(obj.xy - target.xy) for obj in others], dtype=np.float64)
+        receiver = others[int(np.argmin(dists))]
+        direction = _unit_vector(receiver.xy - target.xy)
+        noise = _sample_uniform_range([-config["angle_noise_degrees"]["object_to_object"], config["angle_noise_degrees"]["object_to_object"]], rng)
+        direction = None if direction is None else _unit_vector(_rotate_xy(direction, noise))
+    elif push_type == "cluster" and others:
+        cluster_center = np.mean(np.asarray([obj.xy for obj in others], dtype=np.float64), axis=0)
+        direction = _unit_vector(cluster_center - target.xy)
+        noise = _sample_uniform_range([-config["angle_noise_degrees"]["cluster"], config["angle_noise_degrees"]["cluster"]], rng)
+        direction = None if direction is None else _unit_vector(_rotate_xy(direction, noise))
+    elif push_type == "boundary_recovery":
+        direction = _unit_vector(np.asarray(workspace_center, dtype=np.float64).reshape(2) - target.xy)
+    else:
+        direction = _random_unit_vector(rng)
+    return direction
+
+
+def _compute_auto_push_params(
+    env,
+    valid_objects: Sequence[AutoObjectState],
+    target: AutoObjectState,
+    config: Dict[str, Any],
+    rng: np.random.Generator,
+) -> Optional[AutoPushParams]:
+    lower, upper = _workspace_bounds(env, config)
+    center = _workspace_center(env)
+    half_diag = float(np.linalg.norm(0.5 * _table_full_size(env)))
+    dist_from_center = float(np.linalg.norm(target.xy - center))
+    boundary_threshold = float(config["boundary_threshold_ratio"]) * max(half_diag, 1e-6)
+    push_type = "boundary_recovery" if dist_from_center > boundary_threshold else _weighted_choice(config["push_type_weights"], rng)
+    if push_type in {"object_to_object", "cluster"} and len(valid_objects) <= 1:
+        push_type = "random_free"
+
+    direction = _sample_push_direction(target, valid_objects, push_type, center, config, rng)
+    if direction is None:
+        return None
+    normal = np.asarray([-direction[1], direction[0]], dtype=np.float64)
+    obj_radius = max(float(target.radius), float(config["object_radius_fallback"]))
+    if push_type == "grazing":
+        lateral_abs = _sample_uniform_range(config["lateral_offset_ranges"]["grazing_abs"], rng) * obj_radius
+        lateral_offset = float(lateral_abs * rng.choice([-1.0, 1.0]))
+    elif push_type == "near_miss_or_weak":
+        lateral_abs = _sample_uniform_range(config["lateral_offset_ranges"]["near_miss_abs"], rng) * obj_radius
+        lateral_offset = float(lateral_abs * rng.choice([-1.0, 1.0]))
+    else:
+        lo_hi = config["lateral_offset_ranges"]["default"]
+        lateral_offset = _sample_uniform_range([float(lo_hi[0]) * obj_radius, float(lo_hi[1]) * obj_radius], rng)
+
+    length_key = "weak" if push_type == "near_miss_or_weak" and float(rng.uniform()) < 0.5 else "default"
+    push_length = _sample_uniform_range(config["push_length_ranges"][length_key], rng)
+    start_xy = target.xy - (obj_radius + float(config["ee_radius"]) + float(config["contact_margin"])) * direction
+    start_xy = start_xy + lateral_offset * normal
+    approach_xy = start_xy - float(config["descent_extra_clearance"]) * direction
+    end_xy = start_xy + push_length * direction
+    if (
+        not _in_workspace(approach_xy, lower, upper)
+        or not _in_workspace(start_xy, lower, upper)
+        or not _in_workspace(end_xy, lower, upper)
+    ):
+        return None
+
+    table_z = _table_height(env)
+    z_push = table_z + _sample_uniform_range(config["z_push_range"], rng)
+    z_limits = config["z_push_limits"]
+    z_push = float(np.clip(z_push, table_z + float(z_limits[0]), table_z + float(z_limits[1])))
+    gripper_mode = _weighted_choice(config["gripper_weights"], rng)
+    gripper_cmd = float(config["gripper_commands"].get(gripper_mode, 0.0))
+    return AutoPushParams(
+        target_name=target.name,
+        push_type=push_type,
+        approach_xy=approach_xy.astype(np.float64),
+        start_xy=start_xy.astype(np.float64),
+        end_xy=end_xy.astype(np.float64),
+        z_push=z_push,
+        gripper_cmd=gripper_cmd,
+    )
+
+
+def _auto_delta_action_to_target(
+    env,
+    target_pos: np.ndarray,
+    gripper_cmd: float,
+    config: Dict[str, Any],
+    controller_cfg: dict,
+) -> Tuple[np.ndarray, float]:
+    current_pose = _snapshot_controller_ee_pose(env)
+    target_pos = np.asarray(target_pos, dtype=np.float32).reshape(3)
+    pos_scale, _rot_scale = _controller_output_scales(controller_cfg)
+    delta_pos = target_pos - current_pose[:3]
+    distance = float(np.linalg.norm(delta_pos))
+    kp = float(config["osc_kp"])
+    max_delta = float(config["osc_max_delta"])
+    delta_pos_cmd_m = np.clip(kp * delta_pos, -max_delta, max_delta)
+    delta_pos_cmd = np.clip(delta_pos_cmd_m / pos_scale, -1.0, 1.0).astype(np.float32, copy=False)
+    action_dim = int(getattr(env, "action_dim", 0))
+    if action_dim == 7:
+        action = np.zeros(7, dtype=np.float32)
+        action[:3] = delta_pos_cmd
+        action[3:6] = 0.0
+        action[6] = float(np.clip(gripper_cmd, -1.0, 1.0))
+        return action, distance
+    if action_dim == 6:
+        action = np.zeros(6, dtype=np.float32)
+        action[:3] = delta_pos_cmd
+        action[3:6] = 0.0
+        return action, distance
+    raise RuntimeError(f"Unsupported env.action_dim={action_dim}; expected 6 or 7.")
+
+
+def _auto_move_ee_to(
+    env,
+    target_pos: np.ndarray,
+    gripper_cmd: float,
+    buffer: EpisodeBuffer,
+    config: Dict[str, Any],
+    controller_cfg: dict,
+    max_total_steps: int,
+    max_steps: Optional[int] = None,
+    render: bool = False,
+) -> bool:
+    step_limit = int(max_steps if max_steps is not None else config["max_steps_per_waypoint"])
+    for _ in range(step_limit):
+        if buffer.num_steps >= int(max_total_steps):
+            return False
+        action, distance = _auto_delta_action_to_target(
+            env,
+            target_pos,
+            gripper_cmd,
+            config,
+            controller_cfg,
+        )
+        if distance <= float(config["pos_tolerance"]):
+            return True
+        _record_step(env, action, buffer)
+        if render:
+            env.render()
+    return True
+
+
+def _auto_record_settle_steps(
+    env,
+    gripper_cmd: float,
+    buffer: EpisodeBuffer,
+    max_total_steps: int,
+    settle_steps: int,
+    render: bool = False,
+) -> None:
+    action_dim = int(getattr(env, "action_dim", 0))
+    action = np.zeros((action_dim,), dtype=np.float32)
+    if action_dim == 7:
+        action[-1] = float(np.clip(gripper_cmd, -1.0, 1.0))
+    for _ in range(max(0, int(settle_steps))):
+        if buffer.num_steps >= int(max_total_steps):
+            return
+        _record_step(env, action, buffer)
+        if render:
+            env.render()
+
+
+def _execute_auto_push(
+    env,
+    params: AutoPushParams,
+    buffer: EpisodeBuffer,
+    config: Dict[str, Any],
+    controller_cfg: dict,
+    max_total_steps: int,
+    render: bool = False,
+) -> None:
+    table_z = _table_height(env)
+    clear_z = table_z + float(config["clearance_height"])
+    current_pose = _snapshot_controller_ee_pose(env)
+    current_clear = np.asarray([current_pose[0], current_pose[1], clear_z], dtype=np.float32)
+    approach_clear = np.asarray([params.approach_xy[0], params.approach_xy[1], clear_z], dtype=np.float32)
+    approach_push = np.asarray([params.approach_xy[0], params.approach_xy[1], params.z_push], dtype=np.float32)
+    start_push = np.asarray([params.start_xy[0], params.start_xy[1], params.z_push], dtype=np.float32)
+    end_push = np.asarray([params.end_xy[0], params.end_xy[1], params.z_push], dtype=np.float32)
+    end_clear = np.asarray([params.end_xy[0], params.end_xy[1], clear_z], dtype=np.float32)
+
+    _auto_move_ee_to(
+        env,
+        current_clear,
+        params.gripper_cmd,
+        buffer,
+        config,
+        controller_cfg,
+        max_total_steps,
+        render=render,
+    )
+    _auto_move_ee_to(
+        env,
+        approach_clear,
+        params.gripper_cmd,
+        buffer,
+        config,
+        controller_cfg,
+        max_total_steps,
+        render=render,
+    )
+    _auto_move_ee_to(
+        env,
+        approach_push,
+        params.gripper_cmd,
+        buffer,
+        config,
+        controller_cfg,
+        max_total_steps,
+        render=render,
+    )
+    _auto_move_ee_to(
+        env,
+        start_push,
+        params.gripper_cmd,
+        buffer,
+        config,
+        controller_cfg,
+        max_total_steps,
+        render=render,
+    )
+    if buffer.num_steps >= int(max_total_steps):
+        return
+
+    for alpha in np.linspace(0.0, 1.0, int(config["push_waypoints"])):
+        target_pos = ((1.0 - float(alpha)) * start_push + float(alpha) * end_push).astype(np.float32, copy=False)
+        _auto_move_ee_to(
+            env,
+            target_pos,
+            params.gripper_cmd,
+            buffer,
+            config,
+            controller_cfg,
+            max_total_steps,
+            max_steps=int(config["push_steps_per_waypoint"]),
+            render=render,
+        )
+        if buffer.num_steps >= int(max_total_steps):
+            return
+    _auto_move_ee_to(
+        env,
+        end_clear,
+        params.gripper_cmd,
+        buffer,
+        config,
+        controller_cfg,
+        max_total_steps,
+        render=render,
+    )
+    _auto_record_settle_steps(
+        env,
+        params.gripper_cmd,
+        buffer,
+        max_total_steps=max_total_steps,
+        settle_steps=int(config["settle_steps"]),
+        render=render,
+    )
+
+
 def _controller_output_scales(controller_cfg: dict) -> Tuple[np.ndarray, np.ndarray]:
     output_max = np.asarray(
         controller_cfg.get("output_max", (0.05, 0.05, 0.05, 0.5, 0.5, 0.5)),
@@ -678,6 +1326,7 @@ def _reset_from_bddl(env) -> EpisodeSeed:
 def _append_episode(
     output_path: Path,
     buffer: EpisodeBuffer,
+    episode_attrs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, int]:
     if buffer.num_steps <= 0:
         raise RuntimeError("Cannot append an empty episode.")
@@ -705,6 +1354,12 @@ def _append_episode(
         demo_group.attrs["init_state"] = np.asarray(buffer.init_state, dtype=np.float64)
         demo_group.attrs["model_file"] = str(buffer.model_xml)
         demo_group.attrs["num_samples"] = int(buffer.num_steps)
+        if episode_attrs:
+            for key, value in episode_attrs.items():
+                if isinstance(value, (dict, list, tuple)):
+                    demo_group.attrs[str(key)] = json.dumps(_jsonable(value))
+                else:
+                    demo_group.attrs[str(key)] = _jsonable(value)
 
         demo_group.create_dataset("actions", data=actions)
         demo_group.create_dataset("states", data=states)
@@ -754,6 +1409,119 @@ def _record_step(env, action: np.ndarray, buffer: EpisodeBuffer) -> None:
         buffer.ee_states.append(np.asarray(ee_state, dtype=np.float64).copy())
 
 
+def _restore_collection_scene(
+    env,
+    is_hdf5: bool,
+    source_path: Path,
+    demo_keys: Sequence[str],
+    rng: np.random.Generator,
+) -> EpisodeSeed:
+    if is_hdf5:
+        demo_key = str(rng.choice(demo_keys))
+        seed = _load_episode_seed(source_path, demo_key)
+        _reset_to_episode_seed(env, seed)
+        print(f"[RESET] restored {demo_key}")
+        return seed
+    seed = _reset_from_bddl(env)
+    print("[RESET] restored BDDL scene")
+    return seed
+
+
+def _run_auto_collection(
+    env,
+    args: argparse.Namespace,
+    output_path: Path,
+    source_path: Path,
+    is_hdf5: bool,
+    demo_keys: Sequence[str],
+    rng: np.random.Generator,
+    env_kwargs: dict,
+) -> None:
+    config = _load_auto_config(args.auto_config)
+    target_episodes = int(args.auto_collect)
+    if target_episodes <= 0:
+        return
+    if int(args.max_steps) <= 0:
+        raise RuntimeError("--max-steps must be positive for --auto-collect.")
+
+    if not args.no_render:
+        _install_dual_camera_viewer(env, args)
+
+    controller_cfg = dict(env_kwargs.get("controller_configs", {}) or {})
+    saved = 0
+    discarded = 0
+    last_len = 0
+    push_counts: Dict[str, int] = {}
+    empty_resets = 0
+
+    print(
+        f"[AUTO] collecting {target_episodes} episodes "
+        f"pushes_per_episode={config['pushes_per_episode']} max_steps={int(args.max_steps)}"
+    )
+    while saved < target_episodes:
+        _restore_collection_scene(env, is_hdf5, source_path, demo_keys, rng)
+        if not args.no_render:
+            _install_dual_camera_viewer(env, args)
+            env.render()
+        buffer = EpisodeBuffer.start(env)
+        primitive_idx = 0
+        attempts = 0
+        while primitive_idx < int(config["pushes_per_episode"]) and buffer.num_steps < int(args.max_steps):
+            if attempts >= int(config["max_sampling_attempts"]):
+                print(f"[AUTO] sampling attempts exhausted after {attempts} tries")
+                break
+            valid_objects = _valid_auto_objects(env, config)
+            if not valid_objects:
+                print("[AUTO] no valid movable objects in workspace")
+                break
+            target = _select_target_object(valid_objects, push_counts, config, rng)
+            params = _compute_auto_push_params(env, valid_objects, target, config, rng)
+            attempts += 1
+            if params is None:
+                continue
+
+            push_counts[params.target_name] = int(push_counts.get(params.target_name, 0)) + 1
+            before_steps = buffer.num_steps
+            print(
+                f"[AUTO] push={primitive_idx + 1}/{int(config['pushes_per_episode'])} "
+                f"type={params.push_type} target={params.target_name} steps={buffer.num_steps}"
+            )
+            _execute_auto_push(
+                env,
+                params,
+                buffer,
+                config,
+                controller_cfg,
+                max_total_steps=int(args.max_steps),
+                render=not bool(args.no_render),
+            )
+            if buffer.num_steps <= before_steps:
+                print("[AUTO] primitive produced no steps; stopping this episode")
+                break
+            primitive_idx += 1
+
+        if buffer.num_steps <= 0:
+            discarded += 1
+            empty_resets += 1
+            if empty_resets >= 10:
+                raise RuntimeError("Automatic collection failed to produce any steps after 10 resets.")
+            print("[AUTO] empty episode discarded")
+            continue
+
+        empty_resets = 0
+        demo_key, last_len = _append_episode(output_path, buffer)
+        saved += 1
+        print(f"[SAVED] {demo_key} len={last_len} mode=auto")
+        _print_status(
+            phase="AUTO",
+            saved=saved,
+            discarded=discarded,
+            current_steps=0,
+            last_len=last_len,
+            output_path=output_path,
+        )
+
+
 def _print_status(
     phase: str,
     saved: int,
@@ -769,9 +1537,9 @@ def _print_status(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Collect LIBERO pushing trajectories with Omega.7 teleoperation.")
+    parser = argparse.ArgumentParser(description="Collect LIBERO pushing trajectories with Omega.7 teleoperation or automatic primitives.")
     parser.add_argument("--source", type=str, default=DEFAULT_SOURCE, help="Input .hdf5 or .bddl scene source.")
-    parser.add_argument("--output", type=str, required=True, help="Output HDF5 path.")
+    parser.add_argument("--output", type=str, default=None, help="Output HDF5 path.")
     parser.add_argument(
         "--template-hdf5",
         type=str,
@@ -799,6 +1567,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--render-height", type=int, default=480, help="Per-camera viewer height.")
     parser.add_argument("--overwrite", action="store_true", help="Reinitialize output HDF5 before collecting.")
     parser.add_argument(
+        "--auto-collect",
+        type=int,
+        default=0,
+        help="Collect this many episodes with automatic pushing primitives instead of Omega teleoperation.",
+    )
+    parser.add_argument(
+        "--auto-config",
+        type=str,
+        default=None,
+        help="Optional JSON config for automatic pushing primitive probabilities and controller parameters.",
+    )
+    parser.add_argument(
+        "--dump-auto-config",
+        type=str,
+        default=None,
+        help="Write the default automatic pushing config to this path and exit.",
+    )
+    parser.add_argument(
         "--dry-run-init",
         action="store_true",
         help="Initialize one scene, then exit without creating output or touching Omega.",
@@ -808,6 +1594,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.dump_auto_config is not None:
+        _dump_auto_config(str(args.dump_auto_config))
+        return
+    if args.output is None:
+        raise ValueError("--output is required unless --dump-auto-config is used.")
     source_path = Path(args.source).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve()
     if not source_path.exists():
@@ -871,6 +1662,22 @@ def main() -> None:
         bddl_path=bddl_path,
         overwrite=bool(args.overwrite),
     )
+    if int(args.auto_collect) > 0:
+        try:
+            _run_auto_collection(
+                env=env,
+                args=args,
+                output_path=output_path,
+                source_path=source_path,
+                is_hdf5=is_hdf5,
+                demo_keys=demo_keys,
+                rng=rng,
+                env_kwargs=env_kwargs,
+            )
+            return
+        finally:
+            env.close()
+
     if int(args.max_episodes) <= 0:
         env.close()
         print(f"[INFO] initialized output only: {output_path}")
