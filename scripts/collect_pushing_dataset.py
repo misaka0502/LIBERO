@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import select
@@ -30,6 +31,7 @@ from libero.libero.envs import TASK_MAPPING
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
 BDDL_BASE_PATH = REPO_ROOT / "LIBERO" / "libero" / "libero" / "bddl_files"
+BDDL_NEW_BASE_PATH = REPO_ROOT / "LIBERO" / "libero" / "libero" / "bddl_files_new"
 WM_ROOT = REPO_ROOT / "WM"
 if str(WM_ROOT) not in sys.path:
     sys.path.append(str(WM_ROOT))
@@ -139,6 +141,29 @@ DEFAULT_AUTO_PUSH_CONFIG: Dict[str, Any] = {
 }
 
 
+DEFAULT_RANDOM_INIT_CONFIG: Dict[str, Any] = {
+    "workspace_margin": 0.08,
+    "xy_bounds": [[-0.25, 0.15], [-0.25, 0.25]],
+    "reachable_radius": 0.0,
+    "reachable_center_offset": [0.0, 0.0],
+    "placement_padding": 0.02,
+    "max_scene_attempts": 50,
+    "max_object_attempts": 200,
+    "randomize_movable_objects": True,
+    "randomize_yaw": True,
+    "post_settle_steps": 80,
+    "remove_fixed_fixtures": True,
+    "kept_fixture_categories": [
+        "table",
+        "floor",
+        "kitchen_table",
+        "living_room_table",
+        "study_table",
+        "coffee_table",
+    ],
+}
+
+
 @dataclass(frozen=True)
 class EpisodeSeed:
     demo_key: str
@@ -157,6 +182,22 @@ class AutoObjectState:
     @property
     def xy(self) -> np.ndarray:
         return self.pos[:2]
+
+
+@dataclass(frozen=True)
+class RandomInitObject:
+    name: str
+    joint_name: str
+    body_pos: np.ndarray
+    qpos: np.ndarray
+    radius: float
+
+
+@dataclass(frozen=True)
+class RandomInitResult:
+    enabled: bool
+    object_poses: Dict[str, Dict[str, Any]]
+    scene_attempts: int
 
 
 @dataclass(frozen=True)
@@ -583,6 +624,269 @@ def find_bddl_file(bddl_file_name: str) -> Optional[str]:
     return str(best_path) if best_path is not None else None
 
 
+def _tokenize_bddl_text(text: str) -> List[str]:
+    tokens: List[str] = []
+    for line in text.splitlines():
+        line = line.split(";", 1)[0]
+        if not line.strip():
+            continue
+        spaced = line.replace("(", " ( ").replace(")", " ) ")
+        tokens.extend(spaced.split())
+    return tokens
+
+
+def _parse_bddl_tokens(tokens: Sequence[str]) -> List[Any]:
+    def parse_at(index: int) -> Tuple[Any, int]:
+        if index >= len(tokens):
+            raise RuntimeError("Unexpected end of BDDL while parsing.")
+        token = tokens[index]
+        if token != "(":
+            if token == ")":
+                raise RuntimeError("Unexpected ')' in BDDL.")
+            return token, index + 1
+        expr: List[Any] = []
+        index += 1
+        while index < len(tokens) and tokens[index] != ")":
+            child, index = parse_at(index)
+            expr.append(child)
+        if index >= len(tokens):
+            raise RuntimeError("Unclosed '(' in BDDL.")
+        return expr, index + 1
+
+    expr, next_index = parse_at(0)
+    if next_index != len(tokens):
+        raise RuntimeError("BDDL has trailing tokens after top-level expression.")
+    if not isinstance(expr, list):
+        raise RuntimeError("BDDL top-level expression must be a list.")
+    return expr
+
+
+def _format_bddl_expr(expr: Any, indent: int = 0) -> str:
+    if not isinstance(expr, list):
+        return str(expr)
+    if not expr:
+        return "()"
+    if all(not isinstance(item, list) for item in expr):
+        return " " * indent + "(" + " ".join(str(item) for item in expr) + ")"
+
+    pad = " " * indent
+    if isinstance(expr[0], list):
+        lines = [pad + "("]
+        rest = expr
+    else:
+        lines = [pad + "(" + str(expr[0])]
+        rest = expr[1:]
+    for item in rest:
+        if isinstance(item, list):
+            lines.append(_format_bddl_expr(item, indent + 2))
+        else:
+            lines[-1] += " " + str(item)
+    lines[-1] += ")"
+    return "\n".join(lines)
+
+
+def _typed_section_pairs(section: Sequence[Any], default_category: str) -> List[Tuple[str, str]]:
+    pairs: List[Tuple[str, str]] = []
+    pending: List[str] = []
+    idx = 1
+    while idx < len(section):
+        token = section[idx]
+        if token == "-":
+            idx += 1
+            if idx >= len(section):
+                raise RuntimeError("Malformed typed BDDL section: '-' without category.")
+            category = str(section[idx])
+            pairs.extend((name, category) for name in pending)
+            pending = []
+        else:
+            pending.append(str(token))
+        idx += 1
+    pairs.extend((name, default_category) for name in pending)
+    return pairs
+
+
+def _build_typed_section(header: str, pairs: Sequence[Tuple[str, str]]) -> List[Any]:
+    grouped: Dict[str, List[str]] = {}
+    order: List[str] = []
+    for name, category in pairs:
+        category = str(category)
+        if category not in grouped:
+            grouped[category] = []
+            order.append(category)
+        grouped[category].append(str(name))
+
+    section: List[Any] = [header]
+    for category in order:
+        section.extend(grouped[category])
+        section.extend(["-", category])
+    return section
+
+
+def _section_by_name(root: Sequence[Any], name: str) -> Optional[List[Any]]:
+    for child in root:
+        if isinstance(child, list) and child and child[0] == name:
+            return child
+    return None
+
+
+def _replace_section(root: List[Any], name: str, new_section: List[Any]) -> None:
+    for idx, child in enumerate(root):
+        if isinstance(child, list) and child and child[0] == name:
+            root[idx] = new_section
+            return
+    root.append(new_section)
+
+
+def _region_target(region: Sequence[Any]) -> Optional[str]:
+    for attr in region[1:]:
+        if isinstance(attr, list) and len(attr) >= 2 and attr[0] == ":target":
+            return str(attr[1])
+    return None
+
+
+def _fallback_region_rect(index: int, config: Dict[str, Any]) -> List[float]:
+    bounds = np.asarray(config.get("xy_bounds", DEFAULT_RANDOM_INIT_CONFIG["xy_bounds"]), dtype=np.float64).reshape(2, 2)
+    x0, x1 = float(bounds[0, 0]), float(bounds[0, 1])
+    y0, y1 = float(bounds[1, 0]), float(bounds[1, 1])
+    xs = np.linspace(x0 + 0.04, x1 - 0.04, num=4) if (x1 - x0) > 0.12 else np.asarray([(x0 + x1) * 0.5])
+    ys = np.linspace(y0 + 0.04, y1 - 0.04, num=4) if (y1 - y0) > 0.12 else np.asarray([(y0 + y1) * 0.5])
+    cx = float(xs[index % len(xs)])
+    cy = float(ys[(index // len(xs)) % len(ys)])
+    half = 0.01
+    return [cx - half, cy - half, cx + half, cy + half]
+
+
+def _arg_references_removed_fixture(arg: Any, removed_fixtures: set, removed_regions: set) -> bool:
+    value = str(arg)
+    if value in removed_fixtures or value in removed_regions:
+        return True
+    return any(value.startswith(f"{fixture}_") for fixture in removed_fixtures)
+
+
+def _removed_fixed_fixture_names_from_bddl(original_bddl: str, config: Dict[str, Any]) -> List[str]:
+    source = Path(original_bddl).expanduser().resolve()
+    root = _parse_bddl_tokens(_tokenize_bddl_text(source.read_text(encoding="utf-8")))
+    fixtures_section = _section_by_name(root, ":fixtures")
+    if fixtures_section is None:
+        return []
+    kept_categories = {str(item) for item in config.get("kept_fixture_categories", DEFAULT_RANDOM_INIT_CONFIG["kept_fixture_categories"])}
+    fixture_pairs = _typed_section_pairs(fixtures_section, "fixture")
+    return sorted(name for name, category in fixture_pairs if category not in kept_categories)
+
+
+def _resolve_fixture_free_bddl_from_new_tree(original_bddl: str, config: Dict[str, Any]) -> Tuple[str, List[str]]:
+    source = Path(original_bddl).expanduser().resolve()
+    removed_fixtures = _removed_fixed_fixture_names_from_bddl(str(source), config)
+    if not removed_fixtures:
+        return str(source), []
+    if BDDL_NEW_BASE_PATH in source.parents:
+        candidate = source
+    else:
+        try:
+            rel = source.relative_to(BDDL_BASE_PATH)
+            candidate = BDDL_NEW_BASE_PATH / rel
+        except ValueError:
+            matches = sorted(BDDL_NEW_BASE_PATH.rglob(source.name))
+            candidate = matches[0] if matches else BDDL_NEW_BASE_PATH / source.name
+    if not candidate.exists():
+        raise RuntimeError(
+            "remove_fixed_fixtures=True requires a pre-cleaned BDDL under bddl_files_new, "
+            f"but no mapped file was found for {source}: expected {candidate}"
+        )
+    return str(candidate), removed_fixtures
+
+
+def _write_fixture_free_random_init_bddl(
+    original_bddl: str,
+    config: Dict[str, Any],
+) -> Tuple[str, List[str]]:
+    source = Path(original_bddl).expanduser().resolve()
+    root = _parse_bddl_tokens(_tokenize_bddl_text(source.read_text(encoding="utf-8")))
+    if not root or root[0] != "define":
+        raise RuntimeError(f"Unsupported BDDL top-level form in {source}")
+
+    fixtures_section = _section_by_name(root, ":fixtures")
+    if fixtures_section is None:
+        return str(source), []
+
+    fixture_pairs = _typed_section_pairs(fixtures_section, "fixture")
+    kept_categories = {str(item) for item in config.get("kept_fixture_categories", ["table", "floor"])}
+    kept_pairs = [(name, category) for name, category in fixture_pairs if category in kept_categories]
+    removed_pairs = [(name, category) for name, category in fixture_pairs if category not in kept_categories]
+    removed_fixtures = {name for name, _category in removed_pairs}
+    if not removed_fixtures:
+        return str(source), []
+    if not kept_pairs:
+        raise RuntimeError(
+            "Random init fixture removal would delete every fixture; "
+            f"kept_fixture_categories={sorted(kept_categories)}"
+        )
+
+    support_name = next((name for name, category in kept_pairs if category == "table"), kept_pairs[0][0])
+    _replace_section(root, ":fixtures", _build_typed_section(":fixtures", kept_pairs))
+
+    objects_section = _section_by_name(root, ":objects")
+    object_instances = {name for name, _category in _typed_section_pairs(objects_section, "object")} if objects_section else set()
+
+    regions_section = _section_by_name(root, ":regions")
+    removed_regions: set = set()
+    kept_regions: List[Any] = [":regions"]
+    if regions_section is not None:
+        for region in regions_section[1:]:
+            if not isinstance(region, list) or not region:
+                continue
+            target = _region_target(region)
+            if target in removed_fixtures:
+                removed_regions.add(f"{target}_{region[0]}")
+                continue
+            kept_regions.append(region)
+
+    init_section = _section_by_name(root, ":init")
+    fallback_regions: Dict[str, str] = {}
+    if init_section is not None:
+        new_init: List[Any] = [":init"]
+        for predicate in init_section[1:]:
+            if not isinstance(predicate, list) or not predicate:
+                new_init.append(predicate)
+                continue
+            args = [str(item) for item in predicate[1:]]
+            if args and args[0] in removed_fixtures:
+                continue
+            references_removed = any(_arg_references_removed_fixture(arg, removed_fixtures, removed_regions) for arg in args)
+            if references_removed:
+                if len(predicate) >= 3 and str(predicate[0]) == "On" and str(predicate[1]) in object_instances:
+                    obj_name = str(predicate[1])
+                    region_name = fallback_regions.get(obj_name)
+                    if region_name is None:
+                        region_name = f"random_init_{obj_name}_region"
+                        fallback_regions[obj_name] = region_name
+                    rewritten = list(predicate)
+                    rewritten[2] = f"{support_name}_{region_name}"
+                    new_init.append(rewritten)
+                continue
+            new_init.append(predicate)
+        _replace_section(root, ":init", new_init)
+
+    for index, (_obj_name, region_name) in enumerate(sorted(fallback_regions.items())):
+        kept_regions.append(
+            [
+                region_name,
+                [":target", support_name],
+                [":ranges", [_fallback_region_rect(index, config)]],
+            ]
+        )
+    if regions_section is not None:
+        _replace_section(root, ":regions", kept_regions)
+
+    sanitized_text = _format_bddl_expr(root) + "\n"
+    digest = hashlib.sha1((str(source) + sanitized_text).encode("utf-8")).hexdigest()[:12]
+    out_dir = Path("/tmp/sdf_wm_random_init_bddl")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{source.stem}_movable_only_{digest}.bddl"
+    out_path.write_text(sanitized_text, encoding="utf-8")
+    return str(out_path), sorted(removed_fixtures)
+
+
 def _deep_copy_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return json.loads(json.dumps(config))
 
@@ -751,6 +1055,55 @@ def _load_auto_config(path: Optional[str]) -> Dict[str, Any]:
     return _validate_auto_config(config)
 
 
+def _validate_random_init_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    config = _deep_copy_config(config)
+    for key in ("workspace_margin", "reachable_radius", "placement_padding"):
+        config[key] = float(config[key])
+        if config[key] < 0.0:
+            raise RuntimeError(f"Random init config field {key!r} must be non-negative.")
+    for key in ("max_scene_attempts", "max_object_attempts", "post_settle_steps"):
+        config[key] = int(config[key])
+        if key == "post_settle_steps":
+            if config[key] < 0:
+                raise RuntimeError(f"Random init config field {key!r} must be non-negative.")
+        elif config[key] <= 0:
+            raise RuntimeError(f"Random init config field {key!r} must be positive.")
+    center_offset = np.asarray(config.get("reachable_center_offset", [0.0, 0.0]), dtype=np.float64).reshape(-1)
+    if center_offset.shape[0] != 2:
+        raise RuntimeError("Random init config field 'reachable_center_offset' must contain exactly 2 values.")
+    config["reachable_center_offset"] = center_offset.astype(float).tolist()
+    xy_bounds = config.get("xy_bounds", None)
+    if xy_bounds is not None:
+        arr = np.asarray(xy_bounds, dtype=np.float64)
+        if arr.shape != (2, 2):
+            raise RuntimeError("Random init config field 'xy_bounds' must be [[x_min, x_max], [y_min, y_max]] or null.")
+        if arr[0, 1] < arr[0, 0] or arr[1, 1] < arr[1, 0]:
+            raise RuntimeError("Random init config field 'xy_bounds' min values must be <= max values.")
+        config["xy_bounds"] = arr.astype(float).tolist()
+    config["randomize_movable_objects"] = bool(config.get("randomize_movable_objects", False))
+    config["randomize_yaw"] = bool(config.get("randomize_yaw", True))
+    config["remove_fixed_fixtures"] = bool(config.get("remove_fixed_fixtures", True))
+    kept_categories = config.get("kept_fixture_categories", ["table", "floor"])
+    if isinstance(kept_categories, str):
+        kept_categories = [kept_categories]
+    if not isinstance(kept_categories, (list, tuple)) or not kept_categories:
+        raise RuntimeError("Random init config field 'kept_fixture_categories' must be a non-empty list.")
+    config["kept_fixture_categories"] = [str(value) for value in kept_categories]
+    return config
+
+
+def _load_random_init_config(path: Optional[str]) -> Dict[str, Any]:
+    config = _deep_copy_config(DEFAULT_RANDOM_INIT_CONFIG)
+    if path:
+        config_path = Path(path).expanduser().resolve()
+        with config_path.open("r", encoding="utf-8") as f:
+            user_config = json.load(f)
+        if not isinstance(user_config, dict):
+            raise RuntimeError(f"Random init config must be a JSON object: {config_path}")
+        _deep_update_config(config, user_config)
+    return _validate_random_init_config(config)
+
+
 def _dump_auto_config(path: str) -> None:
     config_path = Path(path).expanduser().resolve()
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -903,6 +1256,230 @@ def _estimate_object_extent(env, body_id: int, fallback_radius: float) -> Tuple[
     radius = max(float(fallback_radius), max(xy_radii) if xy_radii else float(fallback_radius))
     height = max(2.0 * float(fallback_radius), (max(z_highs) - min(z_lows)) if z_lows and z_highs else 0.0)
     return float(radius), float(height)
+
+
+def _joint_addr_range(addr: Any, default_width: int) -> Tuple[int, int]:
+    if isinstance(addr, slice):
+        start = int(0 if addr.start is None else addr.start)
+        stop = int(start + default_width if addr.stop is None else addr.stop)
+        return start, stop
+    if isinstance(addr, (tuple, list, np.ndarray)):
+        values = list(addr)
+        if len(values) >= 2:
+            return int(values[0]), int(values[1])
+        if len(values) == 1:
+            return int(values[0]), int(values[0]) + int(default_width)
+    start = int(addr)
+    return start, start + int(default_width)
+
+
+def _joint_qpos_width(env, joint_name: str) -> int:
+    try:
+        joint_id = int(env.sim.model.joint_name2id(str(joint_name)))
+        joint_type = int(np.asarray(env.sim.model.jnt_type).reshape(-1)[joint_id])
+    except Exception:
+        return 0
+    if joint_type == 0:
+        return 7
+    if joint_type == 1:
+        return 4
+    return 1
+
+
+def _free_joint_name_for_object(env, object_name: str) -> Optional[str]:
+    obj = (getattr(env, "objects_dict", {}) or {}).get(object_name)
+    candidates: List[str] = []
+    for joint_name in list(getattr(obj, "joints", []) or []):
+        candidates.append(str(joint_name))
+    candidates.extend([f"{object_name}_joint0", f"{object_name}_joint", str(object_name)])
+
+    seen = set()
+    for joint_name in candidates:
+        if joint_name in seen:
+            continue
+        seen.add(joint_name)
+        try:
+            env.sim.model.get_joint_qpos_addr(joint_name)
+        except Exception:
+            continue
+        if _joint_qpos_width(env, joint_name) == 7:
+            return str(joint_name)
+    return None
+
+
+def _normalize_qpos_quat_wxyz(qpos: np.ndarray) -> np.ndarray:
+    out = np.asarray(qpos, dtype=np.float64).reshape(7).copy()
+    out[3:7] = _normalize_quat_wxyz(out[3:7]).astype(np.float64)
+    return out
+
+
+def _replace_yaw_preserve_roll_pitch(quat_wxyz: np.ndarray, yaw: float) -> np.ndarray:
+    q = _normalize_quat_wxyz(np.asarray(quat_wxyz, dtype=np.float64).reshape(4))
+    rot = R.from_quat([q[1], q[2], q[3], q[0]])
+    euler_xyz = rot.as_euler("xyz", degrees=False)
+    euler_xyz[2] = float(yaw)
+    out_xyzw = R.from_euler("xyz", euler_xyz, degrees=False).as_quat()
+    return _normalize_quat_wxyz(np.asarray([out_xyzw[3], out_xyzw[0], out_xyzw[1], out_xyzw[2]], dtype=np.float64))
+
+
+def _set_free_joint_qpos_and_clear_velocity(env, joint_name: str, qpos: np.ndarray) -> None:
+    env.sim.data.set_joint_qpos(str(joint_name), _normalize_qpos_quat_wxyz(qpos))
+    try:
+        start, stop = _joint_addr_range(env.sim.model.get_joint_qvel_addr(str(joint_name)), 6)
+        env.sim.data.qvel[start:stop] = 0.0
+    except Exception:
+        pass
+
+
+def _get_random_init_objects(env, config: Dict[str, Any]) -> List[RandomInitObject]:
+    objects: List[RandomInitObject] = []
+    obj_body_id = getattr(env, "obj_body_id", {}) or {}
+    objects_dict = getattr(env, "objects_dict", {}) or {}
+    fallback_radius = float(config.get("object_radius_fallback", DEFAULT_AUTO_PUSH_CONFIG["object_radius_fallback"]))
+    for name in sorted(objects_dict.keys()):
+        if name not in obj_body_id:
+            continue
+        joint_name = _free_joint_name_for_object(env, str(name))
+        if joint_name is None:
+            print(f"[RANDOM-INIT] skip {name}: no 7D free joint")
+            continue
+        try:
+            qpos = np.asarray(env.sim.data.get_joint_qpos(joint_name), dtype=np.float64).reshape(7).copy()
+        except Exception:
+            print(f"[RANDOM-INIT] skip {name}: cannot read free joint qpos")
+            continue
+        body_id = int(obj_body_id[name])
+        body_pos = np.asarray(env.sim.data.body_xpos[body_id], dtype=np.float64).reshape(3).copy()
+        radius, _height = _estimate_object_extent(env, body_id, fallback_radius)
+        objects.append(
+            RandomInitObject(
+                name=str(name),
+                joint_name=str(joint_name),
+                body_pos=body_pos,
+                qpos=_normalize_qpos_quat_wxyz(qpos),
+                radius=float(radius),
+            )
+        )
+    return objects
+
+
+def _sample_random_init_body_xy(
+    env,
+    objects: Sequence[RandomInitObject],
+    config: Dict[str, Any],
+    rng: np.random.Generator,
+) -> Dict[str, np.ndarray]:
+    bounds_config = {"workspace_margin": float(config["workspace_margin"])}
+    lower, upper = _workspace_bounds(env, bounds_config)
+    xy_bounds = config.get("xy_bounds", None)
+    if xy_bounds is not None:
+        center = _workspace_center(env)
+        xy_bounds_arr = np.asarray(xy_bounds, dtype=np.float64).reshape(2, 2)
+        lower = np.maximum(lower, center + np.asarray([xy_bounds_arr[0, 0], xy_bounds_arr[1, 0]], dtype=np.float64))
+        upper = np.minimum(upper, center + np.asarray([xy_bounds_arr[0, 1], xy_bounds_arr[1, 1]], dtype=np.float64))
+    reachable_radius = float(config.get("reachable_radius", 0.0))
+    reachable_center = _workspace_center(env) + np.asarray(
+        config.get("reachable_center_offset", [0.0, 0.0]), dtype=np.float64
+    ).reshape(2)
+    padding = float(config["placement_padding"])
+    placements: Dict[str, np.ndarray] = {}
+    placed: List[Tuple[str, np.ndarray, float]] = []
+
+    for obj in sorted(objects, key=lambda item: (-float(item.radius), item.name)):
+        radius = float(obj.radius) + padding
+        obj_lower = lower + radius
+        obj_upper = upper - radius
+        if np.any(obj_lower > obj_upper):
+            raise RuntimeError(
+                f"Random init workspace is too small for object {obj.name!r}: "
+                f"radius={obj.radius:.4f}, lower={lower.tolist()}, upper={upper.tolist()}"
+            )
+
+        accepted_xy = None
+        for _ in range(int(config["max_object_attempts"])):
+            xy = rng.uniform(obj_lower, obj_upper).astype(np.float64)
+            if reachable_radius > 0.0 and float(np.linalg.norm(xy - reachable_center)) > max(
+                reachable_radius - radius, 0.0
+            ):
+                continue
+            overlaps = any(float(np.linalg.norm(xy - other_xy)) < (radius + other_radius) for _, other_xy, other_radius in placed)
+            if not overlaps:
+                accepted_xy = xy
+                break
+        if accepted_xy is None:
+            raise RuntimeError(f"Could not place object {obj.name!r} without overlap.")
+        placements[obj.name] = accepted_xy
+        placed.append((obj.name, accepted_xy, radius))
+    return placements
+
+
+def _apply_random_object_initialization(env, config: Dict[str, Any], rng: np.random.Generator) -> RandomInitResult:
+    objects = _get_random_init_objects(env, config)
+    if not objects:
+        raise RuntimeError("Random init found no movable env.objects_dict objects with 7D free joints.")
+
+    last_error: Optional[Exception] = None
+    for scene_attempt in range(1, int(config["max_scene_attempts"]) + 1):
+        try:
+            body_xy_targets = _sample_random_init_body_xy(env, objects, config, rng)
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            continue
+
+        object_poses: Dict[str, Dict[str, Any]] = {}
+        for obj in objects:
+            qpos = obj.qpos.copy()
+            yaw = float(rng.uniform(-np.pi, np.pi)) if bool(config["randomize_yaw"]) else float(
+                R.from_quat([qpos[4], qpos[5], qpos[6], qpos[3]]).as_euler("xyz", degrees=False)[2]
+            )
+            quat_new = _replace_yaw_preserve_roll_pitch(qpos[3:7], yaw)
+
+            # qpos is the free-joint root, while body_xpos may include a local body offset.
+            # Keep the sampled body center in XY by recomputing root XY under the new yaw.
+            rot_old = R.from_quat([qpos[4], qpos[5], qpos[6], qpos[3]]).as_matrix()
+            rot_new = R.from_quat([quat_new[1], quat_new[2], quat_new[3], quat_new[0]]).as_matrix()
+            local_offset = rot_old.T @ (obj.body_pos - qpos[:3])
+            new_root_offset = rot_new @ local_offset
+            target_body_xy = np.asarray(body_xy_targets[obj.name], dtype=np.float64).reshape(2)
+            qpos[:2] = target_body_xy - new_root_offset[:2]
+            qpos[3:7] = quat_new
+            _set_free_joint_qpos_and_clear_velocity(env, obj.joint_name, qpos)
+            object_poses[obj.name] = {
+                "joint_name": obj.joint_name,
+                "body_xy": target_body_xy.astype(float).tolist(),
+                "qpos": _normalize_qpos_quat_wxyz(qpos).astype(float).tolist(),
+                "radius": float(obj.radius),
+            }
+
+        env.sim.forward()
+        bounds_config = {"workspace_margin": float(config["workspace_margin"])}
+        log_lower, log_upper = _workspace_bounds(env, bounds_config)
+        xy_bounds = config.get("xy_bounds", None)
+        if xy_bounds is not None:
+            center = _workspace_center(env)
+            xy_bounds_arr = np.asarray(xy_bounds, dtype=np.float64).reshape(2, 2)
+            log_lower = np.maximum(log_lower, center + np.asarray([xy_bounds_arr[0, 0], xy_bounds_arr[1, 0]], dtype=np.float64))
+            log_upper = np.minimum(log_upper, center + np.asarray([xy_bounds_arr[0, 1], xy_bounds_arr[1, 1]], dtype=np.float64))
+        print(
+            f"[RANDOM-INIT] objects={len(object_poses)} fixtures=0 scene_attempts={scene_attempt} "
+            f"xy_lower={log_lower.tolist()} xy_upper={log_upper.tolist()} "
+            f"reachable_radius={float(config.get('reachable_radius', 0.0)):.3f}"
+        )
+        return RandomInitResult(enabled=True, object_poses=object_poses, scene_attempts=int(scene_attempt))
+
+    raise RuntimeError(
+        "Random object initialization failed: workspace may be too small, there may be too many movable objects, "
+        f"or placement_padding={float(config['placement_padding']):.4f} / reachable_radius={float(config['reachable_radius']):.4f} may be too strict."
+    ) from last_error
+
+
+def _settle_scene_without_recording(env, steps: int) -> None:
+    steps = int(steps)
+    if steps <= 0:
+        return
+    for _ in range(steps):
+        env.sim.step()
+    env.sim.forward()
 
 
 def _get_auto_object_states(env, config: Dict[str, Any]) -> List[AutoObjectState]:
@@ -1861,6 +2438,85 @@ def _reset_from_bddl(env) -> EpisodeSeed:
     )
 
 
+def _copy_source_movable_object_qpos(env, seed: EpisodeSeed) -> int:
+    if seed.model_xml is None or seed.init_state is None:
+        return 0
+    source_sim = None
+    source_model = None
+    source_data = None
+    use_mujoco_py = False
+    try:
+        model_xml = libero_utils.postprocess_model_xml(seed.model_xml, {})
+        model_xml = _rewrite_demo_model_xml_paths(model_xml)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[WARN] cannot rewrite source model XML; keeping BDDL movable poses: {exc}")
+        return 0
+
+    try:
+        import mujoco_py  # noqa: PLC0415
+
+        source_model = mujoco_py.load_model_from_xml(model_xml)
+        source_sim = mujoco_py.MjSim(source_model)
+        source_sim.set_state_from_flattened(np.asarray(seed.init_state, dtype=np.float64).reshape(-1))
+        source_sim.forward()
+        use_mujoco_py = True
+    except Exception:
+        source_sim = None
+
+    if source_sim is None:
+        try:
+            import mujoco  # noqa: PLC0415
+
+            source_model = mujoco.MjModel.from_xml_string(model_xml)
+            source_data = mujoco.MjData(source_model)
+            flat_state = np.asarray(seed.init_state, dtype=np.float64).reshape(-1)
+            nq = int(source_model.nq)
+            nv = int(source_model.nv)
+            if flat_state.shape[0] < 1 + nq + nv:
+                raise RuntimeError(f"flattened state too short: got {flat_state.shape[0]}, expected at least {1 + nq + nv}")
+            source_data.time = float(flat_state[0])
+            source_data.qpos[:] = flat_state[1 : 1 + nq]
+            source_data.qvel[:] = flat_state[1 + nq : 1 + nq + nv]
+            mujoco.mj_forward(source_model, source_data)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[WARN] cannot read source demo state for fixture-free reset; keeping BDDL movable poses: {exc}")
+            return 0
+
+    copied = 0
+    for name in sorted((getattr(env, "objects_dict", {}) or {}).keys()):
+        target_joint = _free_joint_name_for_object(env, str(name))
+        if target_joint is None:
+            continue
+        candidates = [target_joint, f"{name}_joint0", f"{name}_joint", str(name)]
+        source_qpos = None
+        for joint_name in candidates:
+            if use_mujoco_py:
+                try:
+                    qpos = np.asarray(source_sim.data.get_joint_qpos(str(joint_name)), dtype=np.float64).reshape(-1)
+                except Exception:
+                    continue
+            else:
+                try:
+                    import mujoco  # noqa: PLC0415
+
+                    joint_id = int(mujoco.mj_name2id(source_model, mujoco.mjtObj.mjOBJ_JOINT, str(joint_name)))
+                    if joint_id < 0 or int(source_model.jnt_type[joint_id]) != 0:
+                        continue
+                    qpos_start = int(source_model.jnt_qposadr[joint_id])
+                    qpos = np.asarray(source_data.qpos[qpos_start : qpos_start + 7], dtype=np.float64).reshape(-1)
+                except Exception:
+                    continue
+            if qpos.shape[0] == 7:
+                source_qpos = qpos.copy()
+                break
+        if source_qpos is None:
+            continue
+        _set_free_joint_qpos_and_clear_velocity(env, target_joint, source_qpos)
+        copied += 1
+    env.sim.forward()
+    return copied
+
+
 def _append_episode(
     output_path: Path,
     buffer: EpisodeBuffer,
@@ -1965,6 +2621,50 @@ def _restore_collection_scene(
     return seed
 
 
+def _restore_collection_scene_for_episode(
+    env,
+    is_hdf5: bool,
+    source_path: Path,
+    demo_keys: Sequence[str],
+    rng: np.random.Generator,
+    random_init_config: Optional[Dict[str, Any]] = None,
+    restore_source_state: bool = True,
+) -> Tuple[EpisodeSeed, Optional[RandomInitResult]]:
+    if restore_source_state:
+        seed = _restore_collection_scene(env, is_hdf5, source_path, demo_keys, rng)
+    else:
+        if is_hdf5:
+            demo_key = str(rng.choice(demo_keys))
+            seed = _load_episode_seed(source_path, demo_key)
+            _reset_from_bddl(env)
+            copied = _copy_source_movable_object_qpos(env, seed)
+            print(f"[RESET] restored fixture-free BDDL scene; copied {copied} movable object poses from {demo_key}")
+        else:
+            seed = _reset_from_bddl(env)
+            print("[RESET] restored fixture-free BDDL scene")
+    if random_init_config is None:
+        return seed, None
+    if not bool(random_init_config.get("randomize_movable_objects", False)):
+        print("[RANDOM-INIT] movable object randomization disabled; preserving BDDL/source movable poses")
+        return seed, None
+    result = _apply_random_object_initialization(env, random_init_config, rng)
+    settle_steps = int(random_init_config.get("post_settle_steps", 0))
+    if settle_steps > 0:
+        _settle_scene_without_recording(env, settle_steps)
+        print(f"[RANDOM-INIT] settled scene for {settle_steps} sim steps before recording")
+    return seed, result
+
+
+def _random_init_episode_attrs(result: Optional[RandomInitResult]) -> Dict[str, Any]:
+    if result is None or not result.enabled:
+        return {}
+    return {
+        "random_init_enabled": True,
+        "random_init_object_poses": result.object_poses,
+        "random_init_scene_attempts": int(result.scene_attempts),
+    }
+
+
 def _run_auto_collection(
     env,
     args: argparse.Namespace,
@@ -1974,6 +2674,8 @@ def _run_auto_collection(
     demo_keys: Sequence[str],
     rng: np.random.Generator,
     env_kwargs: dict,
+    random_init_config: Optional[Dict[str, Any]] = None,
+    restore_source_state: bool = True,
 ) -> None:
     config = _load_auto_config(args.auto_config)
     if args.pushing_per_demo is not None:
@@ -2002,7 +2704,15 @@ def _run_auto_collection(
         f"pushing_per_demo={config['pushes_per_episode']} max_steps_cap={int(args.max_steps)}"
     )
     while saved < target_episodes:
-        _restore_collection_scene(env, is_hdf5, source_path, demo_keys, rng)
+        _, random_init_result = _restore_collection_scene_for_episode(
+            env,
+            is_hdf5,
+            source_path,
+            demo_keys,
+            rng,
+            random_init_config=random_init_config,
+            restore_source_state=restore_source_state,
+        )
         if not args.no_render:
             _install_dual_camera_viewer(env, args)
             env.render()
@@ -2141,6 +2851,7 @@ def _run_auto_collection(
             "auto_max_steps_cap": int(args.max_steps),
             "auto_per_push_quality": per_push_quality,
         }
+        episode_attrs.update(_random_init_episode_attrs(random_init_result))
         demo_key, last_len = _append_episode(output_path, buffer, episode_attrs=episode_attrs)
         saved += 1
         print(
@@ -2234,6 +2945,24 @@ def parse_args() -> argparse.Namespace:
         help="Optional JSON config for automatic pushing primitive probabilities and controller parameters.",
     )
     parser.add_argument(
+        "--random-init",
+        action="store_true",
+        help=(
+            "Use the random-init scene path. By default this creates a temporary fixture-free BDDL that removes "
+            "non-table/floor fixtures and preserves movable object poses; set randomize_movable_objects=true "
+            "in --random-init-config to also randomize movable object x/y/yaw."
+        ),
+    )
+    parser.add_argument(
+        "--random-init-config",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON config overriding random movable-object initialization parameters; "
+            "set remove_fixed_fixtures=false to keep original fixtures."
+        ),
+    )
+    parser.add_argument(
         "--dump-auto-config",
         type=str,
         default=None,
@@ -2252,10 +2981,11 @@ def main() -> None:
     if args.dump_auto_config is not None:
         _dump_auto_config(str(args.dump_auto_config))
         return
-    if args.output is None:
-        raise ValueError("--output is required unless --dump-auto-config is used.")
+    if args.output is None and not bool(args.dry_run_init):
+        raise ValueError("--output is required unless --dump-auto-config or --dry-run-init is used.")
     source_path = Path(args.source).expanduser().resolve()
-    output_path = Path(args.output).expanduser().resolve()
+    output_path = Path(args.output).expanduser().resolve() if args.output is not None else Path("/tmp/collect_pushing_dry_run.hdf5")
+    random_init_config = _load_random_init_config(args.random_init_config) if bool(args.random_init) else None
     if not source_path.exists():
         raise FileNotFoundError(f"Source does not exist: {source_path}")
 
@@ -2287,22 +3017,40 @@ def main() -> None:
         env_args, env_kwargs, bddl_path, problem_info = _make_bddl_env_config(source_path, args)
         demo_keys = []
 
+    restore_source_state = True
+    if random_init_config is not None and bool(random_init_config.get("remove_fixed_fixtures", True)):
+        fixture_free_bddl, removed_fixtures = _resolve_fixture_free_bddl_from_new_tree(bddl_path, random_init_config)
+        if removed_fixtures:
+            bddl_path = fixture_free_bddl
+            env_kwargs["bddl_file_name"] = str(bddl_path)
+            env_args["bddl_file"] = str(bddl_path)
+            env_args["env_kwargs"] = _jsonable(env_kwargs)
+            problem_info = BDDLUtils.get_problem_info(str(bddl_path))
+            restore_source_state = False
+            print(
+                f"[RANDOM-INIT] using bddl_files_new fixture-free BDDL: removed_fixtures={removed_fixtures} "
+                f"path={bddl_path}"
+            )
+
     env = TASK_MAPPING[str(env_args["problem_name"])](**env_kwargs)
     env_args["env_name"] = env.__class__.__name__
     if bool(args.dry_run_init):
         try:
-            if is_hdf5:
-                demo_key = str(rng.choice(demo_keys))
-                seed = _load_episode_seed(source_path, demo_key)
-                _reset_to_episode_seed(env, seed)
-                print(f"[DRY-RUN] restored {demo_key}")
-            else:
-                _reset_from_bddl(env)
-                print("[DRY-RUN] restored BDDL scene")
+            _, random_init_result = _restore_collection_scene_for_episode(
+                env,
+                is_hdf5,
+                source_path,
+                demo_keys,
+                rng,
+                random_init_config=random_init_config,
+                restore_source_state=restore_source_state,
+            )
             print(
                 f"[DRY-RUN] env={env.__class__.__name__} action_dim={getattr(env, 'action_dim', None)} "
                 "raw_demo_schema=actions/states/rewards/dones/robot_states/obs_without_images"
             )
+            if random_init_result is not None:
+                print(f"[DRY-RUN] random_init objects={list(random_init_result.object_poses.keys())} fixtures=0")
             print("[DRY-RUN] no output written; Omega was not initialized")
             return
         finally:
@@ -2328,6 +3076,8 @@ def main() -> None:
                 demo_keys=demo_keys,
                 rng=rng,
                 env_kwargs=env_kwargs,
+                random_init_config=random_init_config,
+                restore_source_state=restore_source_state,
             )
             return
         finally:
@@ -2346,20 +3096,22 @@ def main() -> None:
     phase = "READY"
     update_period = 1.0 / max(float(args.control_hz), 1e-3)
     last_step_time = time.monotonic()
+    current_random_init_result: Optional[RandomInitResult] = None
 
     def reset_round() -> None:
-        nonlocal omega, buffer, phase, last_step_time
+        nonlocal omega, buffer, phase, last_step_time, current_random_init_result
         if omega is not None:
             omega.close()
             omega = None
-        if is_hdf5:
-            demo_key = str(rng.choice(demo_keys))
-            seed = _load_episode_seed(source_path, demo_key)
-            _reset_to_episode_seed(env, seed)
-            print(f"[RESET] restored {demo_key}")
-        else:
-            seed = _reset_from_bddl(env)
-            print("[RESET] restored BDDL scene")
+        _, current_random_init_result = _restore_collection_scene_for_episode(
+            env,
+            is_hdf5,
+            source_path,
+            demo_keys,
+            rng,
+            random_init_config=random_init_config,
+            restore_source_state=restore_source_state,
+        )
         omega = _create_omega_for_current_ee(env, args)
         buffer = None
         phase = "READY"
@@ -2409,7 +3161,12 @@ def main() -> None:
                                 reset_round()
                                 prepare_viewer()
                                 continue
-                            demo_key, last_len = _append_episode(output_path, buffer)
+                            episode_attrs = _random_init_episode_attrs(current_random_init_result)
+                            demo_key, last_len = _append_episode(
+                                output_path,
+                                buffer,
+                                episode_attrs=episode_attrs if episode_attrs else None,
+                            )
                             saved += 1
                             print(f"[SAVED] {demo_key} len={last_len}")
                             reset_round()
@@ -2429,7 +3186,14 @@ def main() -> None:
 
                 if phase == "RECORDING" and buffer is not None and omega is not None:
                     if buffer.num_steps >= int(args.max_steps):
-                        demo_key, last_len = _append_episode(output_path, buffer)
+                        episode_attrs = _random_init_episode_attrs(current_random_init_result)
+                        if episode_attrs:
+                            episode_attrs["save_reason"] = "max_steps"
+                        demo_key, last_len = _append_episode(
+                            output_path,
+                            buffer,
+                            episode_attrs=episode_attrs if episode_attrs else None,
+                        )
                         saved += 1
                         print(f"[SAVED] {demo_key} len={last_len} reason=max_steps")
                         reset_round()
