@@ -56,6 +56,15 @@ DEFAULT_AUTO_PUSH_CONFIG: Dict[str, Any] = {
     "edge_threshold_ratio": 0.72,
     "edge_direction_noise_degrees": 20.0,
     "clearance_height": 0.15,
+    "smooth_transit": {
+        "enabled": True,
+        "step_distance": 0.01,
+        "min_steps": 36,
+        "max_steps": 180,
+        "tracking_gain": 1.4,
+        "final_refine_steps": 16,
+        "extra_clearance": 0.02,
+    },
     "z_push_range": [0.015, 0.04],
     "z_push_limits": [0.01, 0.06],
     "adaptive_z_push": {
@@ -699,6 +708,34 @@ def _validate_auto_config(config: Dict[str, Any]) -> Dict[str, Any]:
     if zcfg["max_offset"] < zcfg["min_offset"]:
         zcfg["min_offset"], zcfg["max_offset"] = zcfg["max_offset"], zcfg["min_offset"]
     config["adaptive_z_push"] = zcfg
+
+    scfg = config.get("smooth_transit", {})
+    if not isinstance(scfg, dict):
+        raise RuntimeError("Auto config field 'smooth_transit' must be an object.")
+    scfg["enabled"] = bool(scfg.get("enabled", True))
+    legacy_waypoints = int(scfg.get("waypoints", 24))
+    legacy_steps_per_waypoint = int(scfg.get("steps_per_waypoint", 8))
+    scfg["step_distance"] = float(scfg.get("step_distance", 0.006))
+    scfg["min_steps"] = int(scfg.get("min_steps", max(1, legacy_waypoints)))
+    scfg["max_steps"] = int(
+        scfg.get("max_steps", max(scfg["min_steps"], legacy_waypoints * legacy_steps_per_waypoint))
+    )
+    scfg["tracking_gain"] = float(scfg.get("tracking_gain", 1.4))
+    scfg["final_refine_steps"] = int(scfg.get("final_refine_steps", 16))
+    scfg["extra_clearance"] = float(scfg.get("extra_clearance", 0.02))
+    if scfg["step_distance"] <= 0.0:
+        raise RuntimeError("Auto config smooth_transit.step_distance must be positive.")
+    if scfg["min_steps"] <= 0:
+        raise RuntimeError("Auto config smooth_transit.min_steps must be positive.")
+    if scfg["max_steps"] < scfg["min_steps"]:
+        raise RuntimeError("Auto config smooth_transit.max_steps must be >= min_steps.")
+    if scfg["tracking_gain"] <= 0.0:
+        raise RuntimeError("Auto config smooth_transit.tracking_gain must be positive.")
+    if scfg["final_refine_steps"] < 0:
+        raise RuntimeError("Auto config smooth_transit.final_refine_steps must be non-negative.")
+    if scfg["extra_clearance"] < 0.0:
+        raise RuntimeError("Auto config smooth_transit.extra_clearance must be non-negative.")
+    config["smooth_transit"] = scfg
     return config
 
 
@@ -970,6 +1007,24 @@ def _update_auto_episode_metrics(
             metrics.max_z_lift[obj.name] = max(float(metrics.max_z_lift.get(obj.name, 0.0)), z_lift)
         if not _in_workspace(obj.xy, lower, upper) or obj.pos[2] < table_z - 0.08:
             metrics.leaves_table = True
+
+
+def _iter_auto_metrics(metrics: Any) -> List[AutoEpisodeMetrics]:
+    if isinstance(metrics, AutoEpisodeMetrics):
+        return [metrics]
+    if isinstance(metrics, (list, tuple)):
+        return [item for item in metrics if isinstance(item, AutoEpisodeMetrics)]
+    return []
+
+
+def _update_auto_metrics(
+    env,
+    metrics: Any,
+    config: Dict[str, Any],
+    contact_groups: Tuple[Dict[int, str], set, set, set],
+) -> None:
+    for item in _iter_auto_metrics(metrics):
+        _update_auto_episode_metrics(env, item, config, contact_groups)
 
 
 def _quat_angle_delta_deg(q0_wxyz: np.ndarray, q1_wxyz: np.ndarray) -> float:
@@ -1271,6 +1326,46 @@ def _auto_delta_action_to_target(
     raise RuntimeError(f"Unsupported env.action_dim={action_dim}; expected 6 or 7.")
 
 
+def _clip_vector_norm(vec: np.ndarray, max_norm: float) -> np.ndarray:
+    out = np.asarray(vec, dtype=np.float32).reshape(3)
+    norm = float(np.linalg.norm(out))
+    if norm > float(max_norm) > 0.0:
+        out = (out * (float(max_norm) / max(norm, 1e-8))).astype(np.float32, copy=False)
+    return out
+
+
+def _auto_delta_action_to_smooth_reference(
+    env,
+    reference_pos: np.ndarray,
+    gripper_cmd: float,
+    config: Dict[str, Any],
+    controller_cfg: dict,
+    speed_scale: float,
+    tracking_gain: float,
+) -> Tuple[np.ndarray, float]:
+    current_pose = _snapshot_controller_ee_pose(env)
+    reference_pos = np.asarray(reference_pos, dtype=np.float32).reshape(3)
+    pos_scale, _rot_scale = _controller_output_scales(controller_cfg)
+    delta_pos = reference_pos - current_pose[:3]
+    distance = float(np.linalg.norm(delta_pos))
+    max_delta = float(config["osc_max_delta"]) * float(speed_scale)
+    delta_pos_cmd_m = _clip_vector_norm(float(tracking_gain) * delta_pos, max_delta)
+    delta_pos_cmd = np.clip(delta_pos_cmd_m / pos_scale, -1.0, 1.0).astype(np.float32, copy=False)
+    action_dim = int(getattr(env, "action_dim", 0))
+    if action_dim == 7:
+        action = np.zeros(7, dtype=np.float32)
+        action[:3] = delta_pos_cmd
+        action[3:6] = 0.0
+        action[6] = float(np.clip(gripper_cmd, -1.0, 1.0))
+        return action, distance
+    if action_dim == 6:
+        action = np.zeros(6, dtype=np.float32)
+        action[:3] = delta_pos_cmd
+        action[3:6] = 0.0
+        return action, distance
+    raise RuntimeError(f"Unsupported env.action_dim={action_dim}; expected 6 or 7.")
+
+
 def _auto_move_ee_to(
     env,
     target_pos: np.ndarray,
@@ -1279,7 +1374,7 @@ def _auto_move_ee_to(
     config: Dict[str, Any],
     controller_cfg: dict,
     speed_scale: float,
-    metrics: AutoEpisodeMetrics,
+    metrics: Any,
     contact_groups: Tuple[Dict[int, str], set, set, set],
     max_total_steps: int,
     max_steps: Optional[int] = None,
@@ -1300,17 +1395,134 @@ def _auto_move_ee_to(
         if distance <= float(config["pos_tolerance"]):
             return True
         _record_step(env, action, buffer)
-        _update_auto_episode_metrics(env, metrics, config, contact_groups)
+        _update_auto_metrics(env, metrics, config, contact_groups)
         if render:
             env.render()
     return False
+
+
+def _minimum_jerk_scalar(u: float) -> float:
+    u = float(np.clip(u, 0.0, 1.0))
+    return float(10.0 * u**3 - 15.0 * u**4 + 6.0 * u**5)
+
+
+def _smooth_transit_step_count(start_pos: np.ndarray, target_pos: np.ndarray, scfg: Dict[str, Any]) -> int:
+    distance = float(
+        np.linalg.norm(
+            np.asarray(target_pos, dtype=np.float32).reshape(3)
+            - np.asarray(start_pos, dtype=np.float32).reshape(3)
+        )
+    )
+    nominal = int(np.ceil(distance / max(float(scfg.get("step_distance", 0.006)), 1e-6)))
+    return int(np.clip(nominal, int(scfg.get("min_steps", 36)), int(scfg.get("max_steps", 180))))
+
+
+def _plan_smooth_transit_trajectory(
+    start_pos: np.ndarray,
+    target_pos: np.ndarray,
+    clear_z: float,
+    num_steps: int,
+) -> np.ndarray:
+    start = np.asarray(start_pos, dtype=np.float32).reshape(3)
+    target = np.asarray(target_pos, dtype=np.float32).reshape(3)
+    n = max(1, int(num_steps))
+    trajectory = np.zeros((n, 3), dtype=np.float32)
+    midpoint_z = 0.5 * (float(start[2]) + float(target[2]))
+    arch_amp = max(0.0, float(clear_z) - midpoint_z)
+    for i, u in enumerate(np.linspace(1.0 / n, 1.0, n)):
+        s = _minimum_jerk_scalar(float(u))
+        pos = ((1.0 - s) * start + s * target).astype(np.float32, copy=False)
+        pos[2] = float(pos[2]) + arch_amp * float(np.sin(np.pi * s))
+        trajectory[i] = pos
+    trajectory[-1] = target
+    return trajectory
+
+
+def _auto_move_ee_smoothly_to(
+    env,
+    target_pos: np.ndarray,
+    gripper_cmd: float,
+    buffer: EpisodeBuffer,
+    config: Dict[str, Any],
+    controller_cfg: dict,
+    speed_scale: float,
+    metrics: Any,
+    contact_groups: Tuple[Dict[int, str], set, set, set],
+    max_total_steps: int,
+    render: bool = False,
+) -> bool:
+    scfg = dict(config.get("smooth_transit", {}) or {})
+    if not bool(scfg.get("enabled", True)):
+        return _auto_move_ee_to(
+            env,
+            target_pos,
+            gripper_cmd,
+            buffer,
+            config,
+            controller_cfg,
+            speed_scale,
+            metrics,
+            contact_groups,
+            max_total_steps,
+            render=render,
+        )
+
+    current_pose = _snapshot_controller_ee_pose(env)
+    table_z = _table_height(env)
+    clear_z = max(
+        table_z + float(config["clearance_height"]) + float(scfg.get("extra_clearance", 0.02)),
+        float(current_pose[2]),
+        float(np.asarray(target_pos, dtype=np.float32).reshape(3)[2]),
+    )
+    num_steps = _smooth_transit_step_count(current_pose[:3], target_pos, scfg)
+    trajectory = _plan_smooth_transit_trajectory(
+        start_pos=current_pose[:3],
+        target_pos=target_pos,
+        clear_z=clear_z,
+        num_steps=num_steps,
+    )
+    for reference_pos in trajectory:
+        if buffer.num_steps >= int(max_total_steps):
+            return False
+        action, _distance = _auto_delta_action_to_smooth_reference(
+            env,
+            reference_pos,
+            gripper_cmd,
+            config,
+            controller_cfg,
+            speed_scale,
+            tracking_gain=float(scfg.get("tracking_gain", 1.4)),
+        )
+        _record_step(env, action, buffer)
+        _update_auto_metrics(env, metrics, config, contact_groups)
+        if render:
+            env.render()
+
+    if int(scfg.get("final_refine_steps", 16)) <= 0:
+        current_pose = _snapshot_controller_ee_pose(env)
+        distance = float(np.linalg.norm(np.asarray(target_pos, dtype=np.float32).reshape(3) - current_pose[:3]))
+        return bool(distance <= float(config["pos_tolerance"]))
+    return _auto_move_ee_to(
+        env,
+        target_pos,
+        gripper_cmd,
+        buffer,
+        config,
+        controller_cfg,
+        speed_scale,
+        metrics,
+        contact_groups,
+        max_total_steps,
+        max_steps=int(scfg.get("final_refine_steps", 16)),
+        render=render,
+    )
 
 
 def _auto_record_settle_steps(
     env,
     gripper_cmd: float,
     buffer: EpisodeBuffer,
-    metrics: AutoEpisodeMetrics,
+    metrics: Any,
     contact_groups: Tuple[Dict[int, str], set, set, set],
     config: Dict[str, Any],
     max_total_steps: int,
@@ -1325,7 +1537,7 @@ def _auto_record_settle_steps(
         if buffer.num_steps >= int(max_total_steps):
             return
         _record_step(env, action, buffer)
-        _update_auto_episode_metrics(env, metrics, config, contact_groups)
+        _update_auto_metrics(env, metrics, config, contact_groups)
         if render:
             env.render()
 
@@ -1337,50 +1549,19 @@ def _execute_auto_push(
     config: Dict[str, Any],
     controller_cfg: dict,
     speed_scale: float,
-    metrics: AutoEpisodeMetrics,
+    metrics: Any,
     contact_groups: Tuple[Dict[int, str], set, set, set],
     max_total_steps: int,
     render: bool = False,
 ) -> None:
     table_z = _table_height(env)
     clear_z = table_z + float(config["clearance_height"])
-    current_pose = _snapshot_controller_ee_pose(env)
-    current_clear = np.asarray([current_pose[0], current_pose[1], clear_z], dtype=np.float32)
-    approach_clear = np.asarray([params.approach_xy[0], params.approach_xy[1], clear_z], dtype=np.float32)
     approach_push = np.asarray([params.approach_xy[0], params.approach_xy[1], params.z_push], dtype=np.float32)
     start_push = np.asarray([params.start_xy[0], params.start_xy[1], params.z_push], dtype=np.float32)
     end_push = np.asarray([params.end_xy[0], params.end_xy[1], params.z_push], dtype=np.float32)
     end_clear = np.asarray([params.end_xy[0], params.end_xy[1], clear_z], dtype=np.float32)
 
-    if not _auto_move_ee_to(
-        env,
-        current_clear,
-        params.gripper_cmd,
-        buffer,
-        config,
-        controller_cfg,
-        speed_scale,
-        metrics,
-        contact_groups,
-        max_total_steps,
-        render=render,
-    ):
-        return
-    if not _auto_move_ee_to(
-        env,
-        approach_clear,
-        params.gripper_cmd,
-        buffer,
-        config,
-        controller_cfg,
-        speed_scale,
-        metrics,
-        contact_groups,
-        max_total_steps,
-        render=render,
-    ):
-        return
-    if not _auto_move_ee_to(
+    if not _auto_move_ee_smoothly_to(
         env,
         approach_push,
         params.gripper_cmd,
@@ -1795,11 +1976,16 @@ def _run_auto_collection(
     env_kwargs: dict,
 ) -> None:
     config = _load_auto_config(args.auto_config)
+    if args.pushing_per_demo is not None:
+        pushing_per_demo = int(args.pushing_per_demo)
+        if pushing_per_demo <= 0:
+            raise RuntimeError("--pushing-per-demo must be positive when set.")
+        config["pushes_per_episode"] = pushing_per_demo
     target_episodes = int(args.auto_collect)
     if target_episodes <= 0:
         return
     if int(args.max_steps) <= 0:
-        raise RuntimeError("--max-steps must be positive for --auto-collect.")
+        raise RuntimeError("--max-steps must be positive for --auto-collect; it is used as a safety cap.")
 
     if not args.no_render:
         _install_dual_camera_viewer(env, args)
@@ -1813,7 +1999,7 @@ def _run_auto_collection(
 
     print(
         f"[AUTO] collecting {target_episodes} episodes "
-        f"pushes_per_episode={config['pushes_per_episode']} max_steps={int(args.max_steps)}"
+        f"pushing_per_demo={config['pushes_per_episode']} max_steps_cap={int(args.max_steps)}"
     )
     while saved < target_episodes:
         _restore_collection_scene(env, is_hdf5, source_path, demo_keys, rng)
@@ -1826,7 +2012,11 @@ def _run_auto_collection(
         episode_speed_scale = _sample_uniform_range(config["episode_speed_scale_range"], rng)
         primitive_idx = 0
         attempts = 0
-        while primitive_idx < int(config["pushes_per_episode"]) and buffer.num_steps < int(args.max_steps):
+        max_steps_reached = False
+        requested_pushes = int(config["pushes_per_episode"])
+        per_push_quality: List[Dict[str, Any]] = []
+        passed_pushes = 0
+        while primitive_idx < requested_pushes and buffer.num_steps < int(args.max_steps):
             if attempts >= int(config["max_sampling_attempts"]):
                 print(f"[AUTO] sampling attempts exhausted after {attempts} tries")
                 break
@@ -1840,8 +2030,8 @@ def _run_auto_collection(
             if params is None:
                 continue
 
-            push_counts[params.target_name] = int(push_counts.get(params.target_name, 0)) + 1
             before_steps = buffer.num_steps
+            push_metrics = _start_auto_episode_metrics(env, config)
             print(
                 f"[AUTO] push={primitive_idx + 1}/{int(config['pushes_per_episode'])} "
                 f"type={params.push_type} target={params.target_name} "
@@ -1854,7 +2044,7 @@ def _run_auto_collection(
                 config,
                 controller_cfg,
                 episode_speed_scale,
-                metrics,
+                (metrics, push_metrics),
                 contact_groups,
                 max_total_steps=int(args.max_steps),
                 render=not bool(args.no_render),
@@ -1862,7 +2052,41 @@ def _run_auto_collection(
             if buffer.num_steps <= before_steps:
                 print("[AUTO] primitive produced no steps; stopping this episode")
                 break
+
+            push_keep, push_quality_category, push_quality_summary = _evaluate_auto_episode_quality(
+                env,
+                push_metrics,
+                config,
+                rng,
+            )
+            push_record = {
+                "push_index": int(primitive_idx),
+                "target_name": str(params.target_name),
+                "push_type": str(params.push_type),
+                "start_step": int(before_steps),
+                "end_step": int(buffer.num_steps),
+                "num_steps": int(buffer.num_steps - before_steps),
+                "quality_category": str(push_quality_category),
+                "quality_metrics": push_quality_summary,
+            }
+            per_push_quality.append(push_record)
+            push_record["quality_passed"] = bool(push_keep)
+            if not push_keep:
+                print(
+                    f"[AUTO] push_quality_failed push={primitive_idx + 1}/{requested_pushes} "
+                    f"type={params.push_type} target={params.target_name} "
+                    f"category={push_quality_category} reason={push_quality_summary.get('decision_reason')} "
+                    f"eef_obj={push_quality_summary['eef_object_contacts']} "
+                    f"obj_obj={push_quality_summary['object_object_contacts']} "
+                    f"moved={push_quality_summary['moved_objects']} "
+                    f"max_disp={push_quality_summary['max_object_displacement']:.4f} "
+                    f"max_rot={push_quality_summary['max_object_rotation_deg']:.2f}"
+                )
+            else:
+                passed_pushes += 1
+            push_counts[params.target_name] = int(push_counts.get(params.target_name, 0)) + 1
             primitive_idx += 1
+        max_steps_reached = buffer.num_steps >= int(args.max_steps) and primitive_idx < requested_pushes
 
         if buffer.num_steps <= 0:
             discarded += 1
@@ -1870,6 +2094,25 @@ def _run_auto_collection(
             if empty_resets >= 10:
                 raise RuntimeError("Automatic collection failed to produce any steps after 10 resets.")
             print("[AUTO] empty episode discarded")
+            continue
+        if primitive_idx < requested_pushes:
+            discarded += 1
+            reason = "max_steps_cap" if max_steps_reached else "incomplete_pushes"
+            print(
+                f"[AUTO-DISCARD] reason={reason} completed_pushes={primitive_idx}/{requested_pushes} "
+                f"len={buffer.num_steps} max_steps_cap={int(args.max_steps)} attempts={attempts}"
+            )
+            continue
+        min_push_quality_ratio = float(np.clip(float(args.min_push_quality_ratio), 0.0, 1.0))
+        push_quality_ratio = float(passed_pushes) / float(max(1, requested_pushes))
+        if push_quality_ratio < min_push_quality_ratio:
+            discarded += 1
+            print(
+                f"[AUTO-DISCARD] reason=push_quality_ratio "
+                f"passed_pushes={passed_pushes}/{requested_pushes} "
+                f"ratio={push_quality_ratio:.3f} required={min_push_quality_ratio:.3f} "
+                f"len={buffer.num_steps}"
+            )
             continue
 
         keep, quality_category, quality_summary = _evaluate_auto_episode_quality(env, metrics, config, rng)
@@ -1890,6 +2133,13 @@ def _run_auto_collection(
             "auto_quality_category": quality_category,
             "auto_quality_metrics": quality_summary,
             "auto_episode_speed_scale": float(episode_speed_scale),
+            "auto_pushes_requested": int(requested_pushes),
+            "auto_pushes_completed": int(primitive_idx),
+            "auto_pushes_passed_quality": int(passed_pushes),
+            "auto_push_quality_ratio": float(push_quality_ratio),
+            "auto_min_push_quality_ratio": float(min_push_quality_ratio),
+            "auto_max_steps_cap": int(args.max_steps),
+            "auto_per_push_quality": per_push_quality,
         }
         demo_key, last_len = _append_episode(output_path, buffer, episode_attrs=episode_attrs)
         saved += 1
@@ -1958,6 +2208,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Collect this many episodes with automatic pushing primitives instead of Omega teleoperation.",
+    )
+    parser.add_argument(
+        "--pushing-per-demo",
+        type=int,
+        default=None,
+        help=(
+            "Automatic mode only: require this many completed pushing primitives in each saved demo. "
+            "Overrides auto_config.pushes_per_episode; --max-steps remains a safety cap, not the target length."
+        ),
+    )
+    parser.add_argument(
+        "--min-push-quality-ratio",
+        type=float,
+        default=0.8,
+        help=(
+            "Automatic mode only: minimum fraction of completed pushing primitives that must pass "
+            "the per-push quality filter before saving the demo. Clipped to [0, 1]."
+        ),
     )
     parser.add_argument(
         "--auto-config",
