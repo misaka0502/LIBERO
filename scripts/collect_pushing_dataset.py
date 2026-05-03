@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import os
@@ -57,7 +58,7 @@ DEFAULT_AUTO_PUSH_CONFIG: Dict[str, Any] = {
     "edge_direction_candidates": 12,
     "edge_threshold_ratio": 0.72,
     "edge_direction_noise_degrees": 20.0,
-    "clearance_height": 0.15,
+    "clearance_height": 0.1,
     "smooth_transit": {
         "enabled": True,
         "step_distance": 0.01,
@@ -68,7 +69,7 @@ DEFAULT_AUTO_PUSH_CONFIG: Dict[str, Any] = {
         "extra_clearance": 0.02,
     },
     "z_push_range": [0.015, 0.04],
-    "z_push_limits": [0.01, 0.06],
+    "z_push_limits": [0.005, 0.06],
     "adaptive_z_push": {
         "enabled": True,
         "height_fraction_range": [0.20, 0.45],
@@ -92,16 +93,16 @@ DEFAULT_AUTO_PUSH_CONFIG: Dict[str, Any] = {
     },
     "push_type_weights": {
         "object_to_object": 0.30,
-        "random_free": 0.30,
-        "grazing": 0.15,
-        "cluster": 0.15,
+        "random_free": 0.50,
+        "grazing": 0.0,
+        "cluster": 0.20,
         "boundary_recovery": 0.05,
-        "near_miss_or_weak": 0.05,
+        "near_miss_or_weak": 0.0,
     },
     "gripper_weights": {
         "closed": 0.50,
-        "half_open": 0.30,
-        "open": 0.20,
+        "half_open": 0.0,
+        "open": 0.50,
     },
     "gripper_commands": {
         "closed": -1.0,
@@ -113,13 +114,13 @@ DEFAULT_AUTO_PUSH_CONFIG: Dict[str, Any] = {
         "weak": [0.03, 0.07],
     },
     "lateral_offset_ranges": {
-        "default": [-0.5, 0.5],
+        "default": [-0.05, 0.05],
         "grazing_abs": [0.5, 0.9],
         "near_miss_abs": [1.1, 1.5],
     },
     "angle_noise_degrees": {
-        "object_to_object": 30.0,
-        "cluster": 30.0,
+        "object_to_object": 10.0,
+        "cluster": 10.0,
     },
     "quality_filter": {
         "enabled": True,
@@ -143,7 +144,7 @@ DEFAULT_AUTO_PUSH_CONFIG: Dict[str, Any] = {
 
 DEFAULT_RANDOM_INIT_CONFIG: Dict[str, Any] = {
     "workspace_margin": 0.08,
-    "xy_bounds": [[-0.25, 0.15], [-0.25, 0.25]],
+    "xy_bounds": [[-0.25, 0.1], [-0.25, 0.25]],
     "reachable_radius": 0.0,
     "reachable_center_offset": [0.0, 0.0],
     "placement_padding": 0.02,
@@ -2130,7 +2131,7 @@ def _execute_auto_push(
     contact_groups: Tuple[Dict[int, str], set, set, set],
     max_total_steps: int,
     render: bool = False,
-) -> None:
+) -> Tuple[bool, str]:
     table_z = _table_height(env)
     clear_z = table_z + float(config["clearance_height"])
     approach_push = np.asarray([params.approach_xy[0], params.approach_xy[1], params.z_push], dtype=np.float32)
@@ -2151,7 +2152,7 @@ def _execute_auto_push(
         max_total_steps,
         render=render,
     ):
-        return
+        return False, "approach"
     if not _auto_move_ee_to(
         env,
         start_push,
@@ -2165,9 +2166,9 @@ def _execute_auto_push(
         max_total_steps,
         render=render,
     ):
-        return
+        return False, "start"
     if buffer.num_steps >= int(max_total_steps):
-        return
+        return False, "max_steps_before_push"
 
     for alpha in np.linspace(0.0, 1.0, int(config["push_waypoints"])):
         target_pos = ((1.0 - float(alpha)) * start_push + float(alpha) * end_push).astype(np.float32, copy=False)
@@ -2185,9 +2186,9 @@ def _execute_auto_push(
             max_steps=int(config["push_steps_per_waypoint"]),
             render=render,
         ):
-            return
+            return False, "push"
         if buffer.num_steps >= int(max_total_steps):
-            return
+            return False, "max_steps_during_push"
     if not _auto_move_ee_to(
         env,
         end_clear,
@@ -2201,7 +2202,7 @@ def _execute_auto_push(
         max_total_steps,
         render=render,
     ):
-        return
+        return False, "end_clear"
     _auto_record_settle_steps(
         env,
         params.gripper_cmd,
@@ -2213,6 +2214,7 @@ def _execute_auto_push(
         settle_steps=int(config["settle_steps"]),
         render=render,
     )
+    return True, "ok"
 
 
 def _controller_output_scales(controller_cfg: dict) -> Tuple[np.ndarray, np.ndarray]:
@@ -2603,6 +2605,41 @@ def _record_step(env, action: np.ndarray, buffer: EpisodeBuffer) -> None:
         buffer.ee_states.append(np.asarray(ee_state, dtype=np.float64).copy())
 
 
+def _truncate_episode_buffer(buffer: EpisodeBuffer, num_steps: int) -> None:
+    num_steps = int(num_steps)
+    for field_name in (
+        "actions",
+        "states",
+        "robot_states",
+        "gripper_states",
+        "joint_states",
+        "ee_states",
+        "rewards",
+    ):
+        values = getattr(buffer, field_name)
+        if len(values) > num_steps:
+            del values[num_steps:]
+
+
+def _restore_flattened_state(env, state_flat: np.ndarray) -> None:
+    env.sim.set_state_from_flattened(np.asarray(state_flat, dtype=np.float64).reshape(-1))
+    env.sim.forward()
+
+
+def _clone_auto_episode_metrics(metrics: AutoEpisodeMetrics) -> AutoEpisodeMetrics:
+    return copy.deepcopy(metrics)
+
+
+def _restore_auto_episode_metrics(dst: AutoEpisodeMetrics, src: AutoEpisodeMetrics) -> None:
+    dst.initial_pos = {name: value.copy() for name, value in src.initial_pos.items()}
+    dst.initial_quat = {name: value.copy() for name, value in src.initial_quat.items()}
+    dst.max_z_lift = {name: float(value) for name, value in src.max_z_lift.items()}
+    dst.eef_object_contacts = int(src.eef_object_contacts)
+    dst.object_object_contacts = int(src.object_object_contacts)
+    dst.robot_table_contacts = int(src.robot_table_contacts)
+    dst.leaves_table = bool(src.leaves_table)
+
+
 def _restore_collection_scene(
     env,
     is_hdf5: bool,
@@ -2741,13 +2778,15 @@ def _run_auto_collection(
                 continue
 
             before_steps = buffer.num_steps
+            pre_push_state = np.asarray(env.sim.get_state().flatten(), dtype=np.float64).copy()
+            pre_push_metrics = _clone_auto_episode_metrics(metrics)
             push_metrics = _start_auto_episode_metrics(env, config)
             print(
                 f"[AUTO] push={primitive_idx + 1}/{int(config['pushes_per_episode'])} "
                 f"type={params.push_type} target={params.target_name} "
                 f"speed={episode_speed_scale:.2f} steps={buffer.num_steps}"
             )
-            _execute_auto_push(
+            primitive_completed, primitive_failed_stage = _execute_auto_push(
                 env,
                 params,
                 buffer,
@@ -2759,6 +2798,15 @@ def _run_auto_collection(
                 max_total_steps=int(args.max_steps),
                 render=not bool(args.no_render),
             )
+            if not primitive_completed:
+                _restore_flattened_state(env, pre_push_state)
+                _restore_auto_episode_metrics(metrics, pre_push_metrics)
+                _truncate_episode_buffer(buffer, before_steps)
+                print(
+                    f"[AUTO] primitive_failed type={params.push_type} target={params.target_name} "
+                    f"stage={primitive_failed_stage}; rolled back transit/control steps attempts={attempts}"
+                )
+                continue
             if buffer.num_steps <= before_steps:
                 print("[AUTO] primitive produced no steps; stopping this episode")
                 break
