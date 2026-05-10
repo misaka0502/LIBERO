@@ -33,6 +33,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
 BDDL_BASE_PATH = REPO_ROOT / "LIBERO" / "libero" / "libero" / "bddl_files"
 BDDL_NEW_BASE_PATH = REPO_ROOT / "LIBERO" / "libero" / "libero" / "bddl_files_new"
+DEFAULT_PUSHING_BDDL = REPO_ROOT / "LIBERO" / "libero" / "libero" / "bddl_files_new_0506" / "pushing_scene.bddl"
 WM_ROOT = REPO_ROOT / "WM"
 if str(WM_ROOT) not in sys.path:
     sys.path.append(str(WM_ROOT))
@@ -40,74 +41,78 @@ if str(WM_ROOT) not in sys.path:
 from omega.omega7_expert import CollectEnum, Omega7Expert  # noqa: E402
 
 
-DEFAULT_SOURCE = (
-    "/home/franka-client/datasets/libero/libero_spatial/"
-    "pick_up_the_black_bowl_between_the_plate_and_the_ramekin_and_place_it_on_the_plate_demo.hdf5"
-)
+DEFAULT_SOURCE = str(DEFAULT_PUSHING_BDDL)
 
 
 DEFAULT_AUTO_PUSH_CONFIG: Dict[str, Any] = {
     "pushes_per_episode": 4,
     "max_sampling_attempts": 80,
+    "max_failures_per_push": 10,
+    "max_approach_failures_per_push": 6,
+    "max_approach_failures_per_target": 3,
     "workspace_margin": 0.08,
     "object_radius_fallback": 0.05,
     "planning_radius_padding": 0.02,
     "ee_radius": 0.02,
     "contact_margin": 0.01,
-    "descent_extra_clearance": 0.08,
+    "descent_extra_clearance": 0.06,
+    "direction_candidate_attempts": 12,
+    "max_approach_ee_xy_distance": 0.50,
+    "start_ee_distance_cost_weight": 0.35,
+    "approach_descent_steps": 120,
     "edge_direction_candidates": 12,
     "edge_threshold_ratio": 0.72,
     "edge_direction_noise_degrees": 20.0,
-    "clearance_height": 0.1,
+    "clearance_height": 0.12,
     "smooth_transit": {
         "enabled": True,
         "step_distance": 0.01,
         "min_steps": 36,
-        "max_steps": 180,
+        "max_steps": 220,
         "tracking_gain": 1.4,
-        "final_refine_steps": 16,
+        "final_refine_steps": 32,
         "extra_clearance": 0.02,
     },
-    "z_push_range": [0.015, 0.04],
-    "z_push_limits": [0.005, 0.06],
+    "z_push_range": [0.02, 0.04],
+    "z_push_limits": [0.018, 0.045],
     "adaptive_z_push": {
         "enabled": True,
-        "height_fraction_range": [0.20, 0.45],
-        "radius_fraction_range": [0.18, 0.45],
-        "min_offset": 0.008,
-        "max_offset": 0.045,
+        "height_fraction_range": [0.25, 0.45],
+        "radius_fraction_range": [0.16, 0.35],
+        "min_offset": 0.018,
+        "max_offset": 0.04,
     },
     "osc_kp": 5.0,
     "osc_max_delta": 0.03,
-    "episode_speed_scale_range": [0.75, 1.35],
-    "pos_tolerance": 0.005,
-    "max_steps_per_waypoint": 80,
+    "episode_speed_scale_range": [0.5, 1.0],
+    "pos_tolerance": 0.008,
+    "max_steps_per_waypoint": 100,
     "push_waypoints": 8,
     "push_steps_per_waypoint": 20,
     "settle_steps": 5,
-    "boundary_threshold_ratio": 0.72,
+    "boundary_threshold_ratio": 0.86,
     "target_sampling_weights": {
         "nearest_neighbor": 0.50,
         "least_pushed": 0.25,
         "uniform": 0.25,
     },
     "push_type_weights": {
-        "object_to_object": 0.30,
-        "random_free": 0.50,
+        "object_to_object": 0.20,
+        "random_free": 0.65,
         "grazing": 0.0,
-        "cluster": 0.20,
-        "boundary_recovery": 0.05,
+        "cluster": 0.10,
+        "boundary_recovery": 0.0,
         "near_miss_or_weak": 0.0,
     },
     "gripper_weights": {
-        "closed": 0.50,
+        "closed": 1.0,
         "half_open": 0.0,
-        "open": 0.50,
+        "open": 0.0,
     },
     "gripper_commands": {
-        "closed": -1.0,
+        "closed": 1.0,
         "half_open": 0.0,
-        "open": 1.0,
+        "open": -1.0,
     },
     "push_length_ranges": {
         "default": [0.08, 0.20],
@@ -143,13 +148,13 @@ DEFAULT_AUTO_PUSH_CONFIG: Dict[str, Any] = {
 
 
 DEFAULT_RANDOM_INIT_CONFIG: Dict[str, Any] = {
-    "workspace_margin": 0.08,
-    "xy_bounds": [[-0.25, 0.1], [-0.25, 0.25]],
+    "workspace_margin": 0.06,
+    "xy_bounds": [[-0.40, 0.0], [-0.25, 0.25]],
     "reachable_radius": 0.0,
     "reachable_center_offset": [0.0, 0.0],
-    "placement_padding": 0.02,
-    "max_scene_attempts": 50,
-    "max_object_attempts": 200,
+    "placement_padding": 0.005,
+    "max_scene_attempts": 200,
+    "max_object_attempts": 500,
     "randomize_movable_objects": True,
     "randomize_yaw": True,
     "post_settle_steps": 80,
@@ -590,6 +595,57 @@ def _quat_to_rotmat_wxyz(quat: np.ndarray) -> np.ndarray:
     return R.from_quat([q[1], q[2], q[3], q[0]]).as_matrix().astype(np.float32)
 
 
+def _yaw_from_quat_wxyz(quat: np.ndarray) -> float:
+    rot = _quat_to_rotmat_wxyz(quat).astype(np.float64)
+    candidate_axes = [rot[:, idx] for idx in range(3)]
+    axis = max(candidate_axes, key=lambda vec: float(np.linalg.norm(vec[:2])))
+    if float(np.linalg.norm(axis[:2])) <= 1e-8:
+        return 0.0
+    return float(np.arctan2(axis[1], axis[0]))
+
+
+def _flat_book_quat_wxyz(yaw: float) -> np.ndarray:
+    rot = R.from_euler("z", float(yaw), degrees=False) * R.from_euler("y", np.pi / 2.0, degrees=False)
+    quat_xyzw = rot.as_quat()
+    return _normalize_quat_wxyz(np.asarray([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]], dtype=np.float64))
+
+
+def _set_object_orientation_preserve_body_xy(env, object_name: str, quat_wxyz: np.ndarray) -> bool:
+    joint_name = _free_joint_name_for_object(env, str(object_name))
+    obj_body_id = getattr(env, "obj_body_id", {}) or {}
+    if joint_name is None or object_name not in obj_body_id:
+        return False
+    qpos = np.asarray(env.sim.data.get_joint_qpos(joint_name), dtype=np.float64).reshape(7).copy()
+    body_pos = np.asarray(env.sim.data.body_xpos[int(obj_body_id[object_name])], dtype=np.float64).reshape(3).copy()
+    quat_new = _normalize_quat_wxyz(np.asarray(quat_wxyz, dtype=np.float64).reshape(4)).astype(np.float64)
+
+    rot_old = _quat_to_rotmat_wxyz(qpos[3:7]).astype(np.float64)
+    rot_new = _quat_to_rotmat_wxyz(quat_new).astype(np.float64)
+    local_offset = rot_old.T @ (body_pos - qpos[:3])
+    new_root_offset = rot_new @ local_offset
+    qpos[:2] = body_pos[:2] - new_root_offset[:2]
+    qpos[3:7] = quat_new
+    _set_free_joint_qpos_and_clear_velocity(env, joint_name, qpos)
+    env.sim.forward()
+    return True
+
+
+def _apply_pushing_scene_pose_fixups(env, settle_steps: int = 40) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    if "black_book_1" in (getattr(env, "objects_dict", {}) or {}):
+        joint_name = _free_joint_name_for_object(env, "black_book_1")
+        if joint_name is not None:
+            qpos = np.asarray(env.sim.data.get_joint_qpos(joint_name), dtype=np.float64).reshape(7).copy()
+            yaw = _yaw_from_quat_wxyz(qpos[3:7])
+            fixed = _set_object_orientation_preserve_body_xy(env, "black_book_1", _flat_book_quat_wxyz(yaw))
+            result["black_book_1_flattened"] = bool(fixed)
+            if fixed:
+                result["black_book_1_yaw"] = float(yaw)
+    if settle_steps > 0 and result:
+        _settle_scene_without_recording(env, int(settle_steps))
+    return result
+
+
 def find_bddl_file(bddl_file_name: str) -> Optional[str]:
     if not bddl_file_name:
         return None
@@ -922,6 +978,11 @@ def _validate_auto_config(config: Dict[str, Any]) -> Dict[str, Any]:
     for key in (
         "pushes_per_episode",
         "max_sampling_attempts",
+        "max_failures_per_push",
+        "max_approach_failures_per_push",
+        "max_approach_failures_per_target",
+        "direction_candidate_attempts",
+        "approach_descent_steps",
         "max_steps_per_waypoint",
         "push_waypoints",
         "push_steps_per_waypoint",
@@ -938,6 +999,8 @@ def _validate_auto_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "ee_radius",
         "contact_margin",
         "descent_extra_clearance",
+        "max_approach_ee_xy_distance",
+        "start_ee_distance_cost_weight",
         "edge_threshold_ratio",
         "edge_direction_noise_degrees",
         "clearance_height",
@@ -953,6 +1016,16 @@ def _validate_auto_config(config: Dict[str, Any]) -> Dict[str, Any]:
         raise RuntimeError("Auto config field 'pushes_per_episode' must be positive.")
     if config["max_sampling_attempts"] <= 0:
         raise RuntimeError("Auto config field 'max_sampling_attempts' must be positive.")
+    if config["max_failures_per_push"] <= 0:
+        raise RuntimeError("Auto config field 'max_failures_per_push' must be positive.")
+    if config["max_approach_failures_per_push"] <= 0:
+        raise RuntimeError("Auto config field 'max_approach_failures_per_push' must be positive.")
+    if config["max_approach_failures_per_target"] < 0:
+        raise RuntimeError("Auto config field 'max_approach_failures_per_target' must be non-negative.")
+    if config["direction_candidate_attempts"] <= 0:
+        raise RuntimeError("Auto config field 'direction_candidate_attempts' must be positive.")
+    if config["approach_descent_steps"] <= 0:
+        raise RuntimeError("Auto config field 'approach_descent_steps' must be positive.")
     if config["max_steps_per_waypoint"] <= 0:
         raise RuntimeError("Auto config field 'max_steps_per_waypoint' must be positive.")
     if config["push_waypoints"] <= 0:
@@ -1234,28 +1307,38 @@ def _estimate_object_extent(env, body_id: int, fallback_radius: float) -> Tuple[
     collision_geom_ids = [gid for gid in geom_ids if geom_group.size <= gid or int(geom_group[gid]) == 0]
     active_geom_ids = collision_geom_ids if collision_geom_ids else geom_ids
 
-    body_pos = np.asarray(data.body_xpos[int(body_id)], dtype=np.float64).reshape(3)
-    xy_radii = []
-    z_lows = []
-    z_highs = []
+    aabb_lows = []
+    aabb_highs = []
     for gid in active_geom_ids:
         geom_pos = np.asarray(data.geom_xpos[gid], dtype=np.float64).reshape(3)
         size = np.asarray(model.geom_size[gid], dtype=np.float64).reshape(-1)
-        if size.size == 0:
-            radius_extent = float(fallback_radius)
-            z_extent = float(fallback_radius)
+        if size.size == 0 or not np.any(size > 0.0):
+            try:
+                radius = float(np.asarray(model.geom_rbound).reshape(-1)[gid])
+            except Exception:
+                radius = float(fallback_radius)
+            local_ext = np.asarray([radius, radius, radius], dtype=np.float64)
         elif size.size == 1:
-            radius_extent = float(size[0])
-            z_extent = float(size[0])
+            radius = float(size[0])
+            local_ext = np.asarray([radius, radius, radius], dtype=np.float64)
+        elif size.size == 2:
+            radius = float(size[0])
+            half_length = float(size[1])
+            local_ext = np.asarray([radius, radius, half_length], dtype=np.float64)
         else:
-            radius_extent = float(max(size[0], size[1] if size.size > 1 else size[0]))
-            z_extent = float(max(size[0], size[1], size[2] if size.size > 2 else size[0]))
-        xy_radii.append(float(np.linalg.norm(geom_pos[:2] - body_pos[:2])) + radius_extent)
-        z_lows.append(float(geom_pos[2] - z_extent))
-        z_highs.append(float(geom_pos[2] + z_extent))
+            local_ext = np.asarray(size[:3], dtype=np.float64)
+        geom_xmat = np.asarray(data.geom_xmat[gid], dtype=np.float64).reshape(3, 3)
+        world_ext = np.abs(geom_xmat) @ local_ext
+        aabb_lows.append(geom_pos - world_ext)
+        aabb_highs.append(geom_pos + world_ext)
 
-    radius = max(float(fallback_radius), max(xy_radii) if xy_radii else float(fallback_radius))
-    height = max(2.0 * float(fallback_radius), (max(z_highs) - min(z_lows)) if z_lows and z_highs else 0.0)
+    if not aabb_lows:
+        return float(fallback_radius), float(2.0 * fallback_radius)
+    lower = np.min(np.asarray(aabb_lows, dtype=np.float64), axis=0)
+    upper = np.max(np.asarray(aabb_highs, dtype=np.float64), axis=0)
+    footprint_size = upper[:2] - lower[:2]
+    radius = max(float(fallback_radius), 0.5 * float(np.linalg.norm(footprint_size)))
+    height = max(0.005, float(upper[2] - lower[2]))
     return float(radius), float(height)
 
 
@@ -1822,38 +1905,70 @@ def _compute_auto_push_params(
     half_diag = float(np.linalg.norm(0.5 * _table_full_size(env)))
     dist_from_center = float(np.linalg.norm(target.xy - center))
     boundary_threshold = float(config["boundary_threshold_ratio"]) * max(half_diag, 1e-6)
-    push_type = "boundary_recovery" if dist_from_center > boundary_threshold else _weighted_choice(config["push_type_weights"], rng)
-    if push_type in {"object_to_object", "cluster"} and len(valid_objects) <= 1:
-        push_type = "random_free"
-
-    direction = _sample_push_direction(target, valid_objects, push_type, center, config, rng)
-    if direction is None:
-        return None
-    normal = np.asarray([-direction[1], direction[0]], dtype=np.float64)
     obj_radius = max(float(target.radius), float(config["object_radius_fallback"]))
     planning_radius = obj_radius + float(config["planning_radius_padding"])
-    if push_type == "grazing":
-        lateral_abs = _sample_uniform_range(config["lateral_offset_ranges"]["grazing_abs"], rng) * planning_radius
-        lateral_offset = float(lateral_abs * rng.choice([-1.0, 1.0]))
-    elif push_type == "near_miss_or_weak":
-        lateral_abs = _sample_uniform_range(config["lateral_offset_ranges"]["near_miss_abs"], rng) * planning_radius
-        lateral_offset = float(lateral_abs * rng.choice([-1.0, 1.0]))
-    else:
-        lo_hi = config["lateral_offset_ranges"]["default"]
-        lateral_offset = _sample_uniform_range([float(lo_hi[0]) * planning_radius, float(lo_hi[1]) * planning_radius], rng)
+    try:
+        current_ee_xy = _snapshot_controller_ee_pose(env)[:2].astype(np.float64)
+    except Exception:
+        current_ee_xy = center.astype(np.float64)
 
-    length_key = "weak" if push_type == "near_miss_or_weak" and float(rng.uniform()) < 0.5 else "default"
-    push_length = _sample_uniform_range(config["push_length_ranges"][length_key], rng)
-    start_xy = target.xy - (planning_radius + float(config["ee_radius"]) + float(config["contact_margin"])) * direction
-    start_xy = start_xy + lateral_offset * normal
-    approach_xy = start_xy - float(config["descent_extra_clearance"]) * direction
-    end_xy = start_xy + push_length * direction
-    if (
-        not _in_workspace(approach_xy, lower, upper)
-        or not _in_workspace(start_xy, lower, upper)
-        or not _in_workspace(end_xy, lower, upper)
-    ):
+    max_approach_dist = float(config.get("max_approach_ee_xy_distance", 0.0))
+    start_cost_weight = float(config.get("start_ee_distance_cost_weight", 0.35))
+    best: Optional[Tuple[float, str, np.ndarray, np.ndarray, np.ndarray]] = None
+    best_over_limit: Optional[Tuple[float, str, np.ndarray, np.ndarray, np.ndarray]] = None
+
+    for _ in range(max(1, int(config.get("direction_candidate_attempts", 1)))):
+        push_type = (
+            "boundary_recovery"
+            if dist_from_center > boundary_threshold
+            else _weighted_choice(config["push_type_weights"], rng)
+        )
+        if push_type in {"object_to_object", "cluster"} and len(valid_objects) <= 1:
+            push_type = "random_free"
+
+        direction = _sample_push_direction(target, valid_objects, push_type, center, config, rng)
+        if direction is None:
+            continue
+        normal = np.asarray([-direction[1], direction[0]], dtype=np.float64)
+        if push_type == "grazing":
+            lateral_abs = _sample_uniform_range(config["lateral_offset_ranges"]["grazing_abs"], rng) * planning_radius
+            lateral_offset = float(lateral_abs * rng.choice([-1.0, 1.0]))
+        elif push_type == "near_miss_or_weak":
+            lateral_abs = _sample_uniform_range(config["lateral_offset_ranges"]["near_miss_abs"], rng) * planning_radius
+            lateral_offset = float(lateral_abs * rng.choice([-1.0, 1.0]))
+        else:
+            lo_hi = config["lateral_offset_ranges"]["default"]
+            lateral_offset = _sample_uniform_range([float(lo_hi[0]) * planning_radius, float(lo_hi[1]) * planning_radius], rng)
+
+        length_key = "weak" if push_type == "near_miss_or_weak" and float(rng.uniform()) < 0.5 else "default"
+        push_length = _sample_uniform_range(config["push_length_ranges"][length_key], rng)
+        start_xy = target.xy - (planning_radius + float(config["ee_radius"]) + float(config["contact_margin"])) * direction
+        start_xy = start_xy + lateral_offset * normal
+        approach_xy = start_xy - float(config["descent_extra_clearance"]) * direction
+        end_xy = start_xy + push_length * direction
+        if (
+            not _in_workspace(approach_xy, lower, upper)
+            or not _in_workspace(start_xy, lower, upper)
+            or not _in_workspace(end_xy, lower, upper)
+        ):
+            continue
+
+        approach_dist = float(np.linalg.norm(approach_xy - current_ee_xy))
+        start_dist = float(np.linalg.norm(start_xy - current_ee_xy))
+        cost = approach_dist + start_cost_weight * start_dist
+        candidate = (cost, push_type, approach_xy, start_xy, end_xy)
+        if max_approach_dist > 0.0 and approach_dist > max_approach_dist:
+            if best_over_limit is None or cost < best_over_limit[0]:
+                best_over_limit = candidate
+            continue
+        if best is None or cost < best[0]:
+            best = candidate
+
+    if best is None:
+        best = best_over_limit
+    if best is None:
         return None
+    _cost, push_type, approach_xy, start_xy, end_xy = best
 
     table_z = _table_height(env)
     z_push = table_z + _sample_z_push_offset(target, config, rng)
@@ -2134,6 +2249,7 @@ def _execute_auto_push(
 ) -> Tuple[bool, str]:
     table_z = _table_height(env)
     clear_z = table_z + float(config["clearance_height"])
+    approach_clear = np.asarray([params.approach_xy[0], params.approach_xy[1], clear_z], dtype=np.float32)
     approach_push = np.asarray([params.approach_xy[0], params.approach_xy[1], params.z_push], dtype=np.float32)
     start_push = np.asarray([params.start_xy[0], params.start_xy[1], params.z_push], dtype=np.float32)
     end_push = np.asarray([params.end_xy[0], params.end_xy[1], params.z_push], dtype=np.float32)
@@ -2141,7 +2257,7 @@ def _execute_auto_push(
 
     if not _auto_move_ee_smoothly_to(
         env,
-        approach_push,
+        approach_clear,
         params.gripper_cmd,
         buffer,
         config,
@@ -2153,6 +2269,21 @@ def _execute_auto_push(
         render=render,
     ):
         return False, "approach"
+    if not _auto_move_ee_to(
+        env,
+        approach_push,
+        params.gripper_cmd,
+        buffer,
+        config,
+        controller_cfg,
+        speed_scale,
+        metrics,
+        contact_groups,
+        max_total_steps,
+        max_steps=int(config["approach_descent_steps"]),
+        render=render,
+    ):
+        return False, "approach_descent"
     if not _auto_move_ee_to(
         env,
         start_push,
@@ -2432,7 +2563,10 @@ def _reset_to_episode_seed(env, seed: EpisodeSeed) -> None:
 
 def _reset_from_bddl(env) -> EpisodeSeed:
     _safe_reset(env)
+    fixups = _apply_pushing_scene_pose_fixups(env)
     env.sim.forward()
+    if fixups.get("black_book_1_flattened"):
+        print("[RESET] applied pushing scene pose fixup: black_book_1 flat on table")
     return EpisodeSeed(
         demo_key="bddl_reset",
         model_xml=str(env.sim.model.get_xml()),
@@ -2642,17 +2776,7 @@ def _restore_auto_episode_metrics(dst: AutoEpisodeMetrics, src: AutoEpisodeMetri
 
 def _restore_collection_scene(
     env,
-    is_hdf5: bool,
-    source_path: Path,
-    demo_keys: Sequence[str],
-    rng: np.random.Generator,
 ) -> EpisodeSeed:
-    if is_hdf5:
-        demo_key = str(rng.choice(demo_keys))
-        seed = _load_episode_seed(source_path, demo_key)
-        _reset_to_episode_seed(env, seed)
-        print(f"[RESET] restored {demo_key}")
-        return seed
     seed = _reset_from_bddl(env)
     print("[RESET] restored BDDL scene")
     return seed
@@ -2660,31 +2784,18 @@ def _restore_collection_scene(
 
 def _restore_collection_scene_for_episode(
     env,
-    is_hdf5: bool,
-    source_path: Path,
-    demo_keys: Sequence[str],
     rng: np.random.Generator,
     random_init_config: Optional[Dict[str, Any]] = None,
-    restore_source_state: bool = True,
 ) -> Tuple[EpisodeSeed, Optional[RandomInitResult]]:
-    if restore_source_state:
-        seed = _restore_collection_scene(env, is_hdf5, source_path, demo_keys, rng)
-    else:
-        if is_hdf5:
-            demo_key = str(rng.choice(demo_keys))
-            seed = _load_episode_seed(source_path, demo_key)
-            _reset_from_bddl(env)
-            copied = _copy_source_movable_object_qpos(env, seed)
-            print(f"[RESET] restored fixture-free BDDL scene; copied {copied} movable object poses from {demo_key}")
-        else:
-            seed = _reset_from_bddl(env)
-            print("[RESET] restored fixture-free BDDL scene")
+    seed = _restore_collection_scene(env)
     if random_init_config is None:
         return seed, None
     if not bool(random_init_config.get("randomize_movable_objects", False)):
-        print("[RANDOM-INIT] movable object randomization disabled; preserving BDDL/source movable poses")
+        _apply_pushing_scene_pose_fixups(env)
+        print("[RANDOM-INIT] movable object randomization disabled; preserving BDDL movable poses")
         return seed, None
     result = _apply_random_object_initialization(env, random_init_config, rng)
+    _apply_pushing_scene_pose_fixups(env)
     settle_steps = int(random_init_config.get("post_settle_steps", 0))
     if settle_steps > 0:
         _settle_scene_without_recording(env, settle_steps)
@@ -2702,17 +2813,27 @@ def _random_init_episode_attrs(result: Optional[RandomInitResult]) -> Dict[str, 
     }
 
 
+def _print_dry_run_geometry_summary(env) -> None:
+    config = _validate_auto_config(DEFAULT_AUTO_PUSH_CONFIG)
+    objects = {obj.name: obj for obj in _get_auto_object_states(env, config)}
+    black_book = objects.get("black_book_1")
+    if black_book is None:
+        return
+    print(
+        "[DRY-RUN] black_book_1 "
+        f"pos={np.round(black_book.pos, 4).tolist()} "
+        f"quat_wxyz={np.round(_normalize_quat_wxyz(black_book.quat_wxyz), 4).tolist()} "
+        f"radius={black_book.radius:.4f} height={black_book.height:.4f}"
+    )
+
+
 def _run_auto_collection(
     env,
     args: argparse.Namespace,
     output_path: Path,
-    source_path: Path,
-    is_hdf5: bool,
-    demo_keys: Sequence[str],
     rng: np.random.Generator,
     env_kwargs: dict,
     random_init_config: Optional[Dict[str, Any]] = None,
-    restore_source_state: bool = True,
 ) -> None:
     config = _load_auto_config(args.auto_config)
     if args.pushing_per_demo is not None:
@@ -2741,15 +2862,19 @@ def _run_auto_collection(
         f"pushing_per_demo={config['pushes_per_episode']} max_steps_cap={int(args.max_steps)}"
     )
     while saved < target_episodes:
-        _, random_init_result = _restore_collection_scene_for_episode(
-            env,
-            is_hdf5,
-            source_path,
-            demo_keys,
-            rng,
-            random_init_config=random_init_config,
-            restore_source_state=restore_source_state,
-        )
+        try:
+            _, random_init_result = _restore_collection_scene_for_episode(
+                env,
+                rng,
+                random_init_config=random_init_config,
+            )
+        except Exception as exc:  # noqa: BLE001
+            discarded += 1
+            empty_resets += 1
+            print(f"[AUTO-DISCARD] reason=reset_failed error={exc}")
+            if empty_resets >= 10:
+                raise RuntimeError("Automatic collection failed to initialize a usable scene after 10 resets.") from exc
+            continue
         if not args.no_render:
             _install_dual_camera_viewer(env, args)
             env.render()
@@ -2763,14 +2888,41 @@ def _run_auto_collection(
         requested_pushes = int(config["pushes_per_episode"])
         per_push_quality: List[Dict[str, Any]] = []
         passed_pushes = 0
+        approach_failures_by_target: Dict[str, int] = {}
+        current_push_failures = 0
+        current_push_approach_failures = 0
+        abort_episode_reason: Optional[str] = None
         while primitive_idx < requested_pushes and buffer.num_steps < int(args.max_steps):
             if attempts >= int(config["max_sampling_attempts"]):
                 print(f"[AUTO] sampling attempts exhausted after {attempts} tries")
+                break
+            if current_push_failures >= int(config["max_failures_per_push"]):
+                abort_episode_reason = "push_failure_budget"
+                print(
+                    f"[AUTO] push failure budget exhausted push={primitive_idx + 1}/{requested_pushes} "
+                    f"failures={current_push_failures} attempts={attempts}"
+                )
+                break
+            if current_push_approach_failures >= int(config["max_approach_failures_per_push"]):
+                abort_episode_reason = "approach_failure_budget"
+                print(
+                    f"[AUTO] approach failure budget exhausted push={primitive_idx + 1}/{requested_pushes} "
+                    f"approach_failures={current_push_approach_failures} attempts={attempts}"
+                )
                 break
             valid_objects = _valid_auto_objects(env, config)
             if not valid_objects:
                 print("[AUTO] no valid movable objects in workspace")
                 break
+            max_approach_failures = int(config.get("max_approach_failures_per_target", 0))
+            if max_approach_failures > 0:
+                eligible_objects = [
+                    obj
+                    for obj in valid_objects
+                    if int(approach_failures_by_target.get(obj.name, 0)) < max_approach_failures
+                ]
+                if eligible_objects:
+                    valid_objects = eligible_objects
             target = _select_target_object(valid_objects, push_counts, config, rng)
             params = _compute_auto_push_params(env, valid_objects, target, config, rng)
             attempts += 1
@@ -2802,10 +2954,16 @@ def _run_auto_collection(
                 _restore_flattened_state(env, pre_push_state)
                 _restore_auto_episode_metrics(metrics, pre_push_metrics)
                 _truncate_episode_buffer(buffer, before_steps)
+                current_push_failures += 1
                 print(
                     f"[AUTO] primitive_failed type={params.push_type} target={params.target_name} "
                     f"stage={primitive_failed_stage}; rolled back transit/control steps attempts={attempts}"
                 )
+                if primitive_failed_stage in {"approach", "approach_descent"}:
+                    current_push_approach_failures += 1
+                    approach_failures_by_target[params.target_name] = (
+                        int(approach_failures_by_target.get(params.target_name, 0)) + 1
+                    )
                 continue
             if buffer.num_steps <= before_steps:
                 print("[AUTO] primitive produced no steps; stopping this episode")
@@ -2842,8 +3000,11 @@ def _run_auto_collection(
                 )
             else:
                 passed_pushes += 1
+            approach_failures_by_target[params.target_name] = 0
             push_counts[params.target_name] = int(push_counts.get(params.target_name, 0)) + 1
             primitive_idx += 1
+            current_push_failures = 0
+            current_push_approach_failures = 0
         max_steps_reached = buffer.num_steps >= int(args.max_steps) and primitive_idx < requested_pushes
 
         if buffer.num_steps <= 0:
@@ -2853,14 +3014,9 @@ def _run_auto_collection(
                 raise RuntimeError("Automatic collection failed to produce any steps after 10 resets.")
             print("[AUTO] empty episode discarded")
             continue
+        incomplete_reason: Optional[str] = None
         if primitive_idx < requested_pushes:
-            discarded += 1
-            reason = "max_steps_cap" if max_steps_reached else "incomplete_pushes"
-            print(
-                f"[AUTO-DISCARD] reason={reason} completed_pushes={primitive_idx}/{requested_pushes} "
-                f"len={buffer.num_steps} max_steps_cap={int(args.max_steps)} attempts={attempts}"
-            )
-            continue
+            incomplete_reason = abort_episode_reason or ("max_steps_cap" if max_steps_reached else "incomplete_pushes")
         min_push_quality_ratio = float(np.clip(float(args.min_push_quality_ratio), 0.0, 1.0))
         push_quality_ratio = float(passed_pushes) / float(max(1, requested_pushes))
         if push_quality_ratio < min_push_quality_ratio:
@@ -2869,7 +3025,8 @@ def _run_auto_collection(
                 f"[AUTO-DISCARD] reason=push_quality_ratio "
                 f"passed_pushes={passed_pushes}/{requested_pushes} "
                 f"ratio={push_quality_ratio:.3f} required={min_push_quality_ratio:.3f} "
-                f"len={buffer.num_steps}"
+                f"completed_pushes={primitive_idx}/{requested_pushes} "
+                f"incomplete_reason={incomplete_reason} len={buffer.num_steps}"
             )
             continue
 
@@ -2896,6 +3053,8 @@ def _run_auto_collection(
             "auto_pushes_passed_quality": int(passed_pushes),
             "auto_push_quality_ratio": float(push_quality_ratio),
             "auto_min_push_quality_ratio": float(min_push_quality_ratio),
+            "auto_incomplete_reason": "" if incomplete_reason is None else str(incomplete_reason),
+            "auto_completed_requested_pushes": bool(primitive_idx >= requested_pushes),
             "auto_max_steps_cap": int(args.max_steps),
             "auto_per_push_quality": per_push_quality,
         }
@@ -2904,6 +3063,7 @@ def _run_auto_collection(
         saved += 1
         print(
             f"[SAVED] {demo_key} len={last_len} mode=auto quality={quality_category} "
+            f"pushes={primitive_idx}/{requested_pushes} passed={passed_pushes}/{requested_pushes} "
             f"eef_obj={quality_summary['eef_object_contacts']} obj_obj={quality_summary['object_object_contacts']} "
             f"moved={quality_summary['moved_objects']} max_disp={quality_summary['max_object_displacement']:.4f} "
             f"max_rot={quality_summary['max_object_rotation_deg']:.2f}"
@@ -2934,14 +3094,8 @@ def _print_status(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect LIBERO pushing trajectories with Omega.7 teleoperation or automatic primitives.")
-    parser.add_argument("--source", type=str, default=DEFAULT_SOURCE, help="Input .hdf5 or .bddl scene source.")
+    parser.add_argument("--source", type=str, default=DEFAULT_SOURCE, help="Input .bddl scene source.")
     parser.add_argument("--output", type=str, default=None, help="Output HDF5 path.")
-    parser.add_argument(
-        "--template-hdf5",
-        type=str,
-        default=None,
-        help="Optional HDF5 used only for copying data attrs when --source is a .bddl file.",
-    )
     parser.add_argument("--max-episodes", type=int, default=50)
     parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--control-hz", type=float, default=20.0)
@@ -2980,7 +3134,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--min-push-quality-ratio",
         type=float,
-        default=0.8,
+        default=0.75,
         help=(
             "Automatic mode only: minimum fraction of completed pushing primitives that must pass "
             "the per-push quality filter before saving the demo. Clipped to [0, 1]."
@@ -3034,38 +3188,20 @@ def main() -> None:
     source_path = Path(args.source).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve() if args.output is not None else Path("/tmp/collect_pushing_dry_run.hdf5")
     random_init_config = _load_random_init_config(args.random_init_config) if bool(args.random_init) else None
+    is_bddl = source_path.suffix.lower() == ".bddl"
+    if source_path.suffix.lower() in {".hdf5", ".h5"}:
+        raise ValueError(
+            f"--source now accepts only a .bddl scene file; input HDF5 demos are no longer supported: {source_path}"
+        )
+    if not is_bddl:
+        raise ValueError(f"--source must be a .bddl scene file, got: {source_path}")
     if not source_path.exists():
         raise FileNotFoundError(f"Source does not exist: {source_path}")
 
-    is_hdf5 = source_path.suffix.lower() in {".hdf5", ".h5"}
-    is_bddl = source_path.suffix.lower() == ".bddl"
-    if not (is_hdf5 or is_bddl):
-        raise ValueError(f"--source must be .hdf5 or .bddl, got: {source_path}")
-
     rng = np.random.default_rng(int(args.seed))
-    template_hdf5: Optional[Path]
-    if is_hdf5:
-        template_hdf5 = source_path
-    elif args.template_hdf5 is not None:
-        template_hdf5 = Path(args.template_hdf5).expanduser().resolve()
-        if not template_hdf5.exists():
-            raise FileNotFoundError(f"Template HDF5 does not exist: {template_hdf5}")
-    else:
-        template_hdf5 = None
+    template_hdf5: Optional[Path] = None
+    env_args, env_kwargs, bddl_path, problem_info = _make_bddl_env_config(source_path, args)
 
-    if is_hdf5:
-        env_args, env_kwargs, bddl_path = _make_hdf5_env_config(source_path, args)
-        problem_info = _load_problem_info_from_template(source_path, bddl_path)
-        demo_keys: List[str]
-        with h5py.File(source_path, "r") as f:
-            demo_keys = _sorted_demo_keys(f["data"])
-        if not demo_keys:
-            raise RuntimeError(f"No demo_* groups found in source HDF5: {source_path}")
-    else:
-        env_args, env_kwargs, bddl_path, problem_info = _make_bddl_env_config(source_path, args)
-        demo_keys = []
-
-    restore_source_state = True
     if random_init_config is not None and bool(random_init_config.get("remove_fixed_fixtures", True)):
         fixture_free_bddl, removed_fixtures = _resolve_fixture_free_bddl_from_new_tree(bddl_path, random_init_config)
         if removed_fixtures:
@@ -3074,7 +3210,6 @@ def main() -> None:
             env_args["bddl_file"] = str(bddl_path)
             env_args["env_kwargs"] = _jsonable(env_kwargs)
             problem_info = BDDLUtils.get_problem_info(str(bddl_path))
-            restore_source_state = False
             print(
                 f"[RANDOM-INIT] using bddl_files_new fixture-free BDDL: removed_fixtures={removed_fixtures} "
                 f"path={bddl_path}"
@@ -3086,17 +3221,14 @@ def main() -> None:
         try:
             _, random_init_result = _restore_collection_scene_for_episode(
                 env,
-                is_hdf5,
-                source_path,
-                demo_keys,
                 rng,
                 random_init_config=random_init_config,
-                restore_source_state=restore_source_state,
             )
             print(
                 f"[DRY-RUN] env={env.__class__.__name__} action_dim={getattr(env, 'action_dim', None)} "
                 "raw_demo_schema=actions/states/rewards/dones/robot_states/obs_without_images"
             )
+            _print_dry_run_geometry_summary(env)
             if random_init_result is not None:
                 print(f"[DRY-RUN] random_init objects={list(random_init_result.object_poses.keys())} fixtures=0")
             print("[DRY-RUN] no output written; Omega was not initialized")
@@ -3119,13 +3251,9 @@ def main() -> None:
                 env=env,
                 args=args,
                 output_path=output_path,
-                source_path=source_path,
-                is_hdf5=is_hdf5,
-                demo_keys=demo_keys,
                 rng=rng,
                 env_kwargs=env_kwargs,
                 random_init_config=random_init_config,
-                restore_source_state=restore_source_state,
             )
             return
         finally:
@@ -3153,12 +3281,8 @@ def main() -> None:
             omega = None
         _, current_random_init_result = _restore_collection_scene_for_episode(
             env,
-            is_hdf5,
-            source_path,
-            demo_keys,
             rng,
             random_init_config=random_init_config,
-            restore_source_state=restore_source_state,
         )
         omega = _create_omega_for_current_ee(env, args)
         buffer = None

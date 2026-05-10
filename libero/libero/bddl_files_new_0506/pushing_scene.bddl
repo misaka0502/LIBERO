@@ -1,0 +1,88 @@
+(define
+  (problem LIBERO_Tabletop_Manipulation)
+  (:domain robosuite)
+  (:language Pick the akita black bowl between the plate and the ramekin and place it on the plate)
+  (:regions
+    (plate_region
+      (:target main_table)
+      (:ranges
+        (
+          (0.05 0.19 0.07 0.21))))
+    (black_book_region
+      (:target main_table)
+      (:ranges
+        (
+          (0.05 0.09 0.09 0.13)))
+      (:yaw_rotation
+        (
+          (-1.5707963267948966 -0.7853981633974483))))
+    (white_yellow_mug_region
+      (:target main_table)
+      (:ranges
+        (
+          (0.16 0.06 0.20 0.10))))
+    (next_to_plate_region
+      (:target main_table)
+      (:ranges
+        (
+          (0.0 0.3 0.02 0.32))))
+    (box_region
+      (:target main_table)
+      (:ranges
+        (
+          (0.06 0.02 0.08 0.04))))
+    (next_to_box_region
+      (:target main_table)
+      (:ranges
+        (
+          (0.12 -0.08 0.14 -0.06))))
+    (between_plate_ramekin_region
+      (:target main_table)
+      (:ranges
+        (
+          (-0.06 0.19 -0.04 0.21))))
+    (ramekin_region
+      (:target main_table)
+      (:ranges
+        (
+          (-0.21 0.19 -0.19 0.21))))
+    (next_to_ramekin_region
+      (:target main_table)
+      (:ranges
+        (
+          (-0.19 0.31 -0.17 0.33))))
+    (table_center
+      (:target main_table)
+      (:ranges
+        (
+          (-0.1 -0.01 -0.05 0.01))))
+    (table_front
+      (:target main_table)
+      (:ranges
+        (
+          (0.19 -0.01 0.21 0.01))))
+    (cabinet_region
+      (:target main_table)
+      (:ranges
+        (
+          (0.02 -0.28 0.04 -0.26)))
+      (:yaw_rotation
+        (
+          (2.6613777765410678 2.7242096296128633))))
+    (stove_region
+      (:target main_table)
+      (:ranges
+        (
+          (-0.42 -0.15 -0.4 -0.13)))))
+  (:fixtures main_table - table)
+  (:objects akita_black_bowl_1 akita_black_bowl_2 - akita_black_bowl glazed_rim_porcelain_ramekin_1 - glazed_rim_porcelain_ramekin black_book_1 - black_book white_yellow_mug_1 - white_yellow_mug)
+  (:obj_of_interest akita_black_bowl_1 black_book_1 white_yellow_mug_1)
+  (:init
+    (On akita_black_bowl_1 main_table_between_plate_ramekin_region)
+    (On akita_black_bowl_2 main_table_next_to_ramekin_region)
+    (On black_book_1 main_table_black_book_region)
+    (On white_yellow_mug_1 main_table_white_yellow_mug_region)
+    (On glazed_rim_porcelain_ramekin_1 main_table_ramekin_region))
+  (:goal
+    (And
+      (On akita_black_bowl_1 main_table_plate_region))))
