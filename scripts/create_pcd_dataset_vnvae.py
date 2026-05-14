@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import xml.etree.ElementTree as ET
 from typing import List, Set, Tuple
@@ -2909,17 +2910,16 @@ def process_hdf5_file(
         if output_path is None:
             output_path = hdf5_path.replace(".hdf5", "_pcd.hdf5")
 
-        import shutil
-
         output_parent = os.path.dirname(output_path)
         if output_parent:
             os.makedirs(output_parent, exist_ok=True)
-        shutil.copy2(hdf5_path, output_path)
+        if ignore_image:
+            removed_image_count = rewrite_hdf5_file(hdf5_path, output_path, skip_images=True)
+            print(f"  Removed image observation datasets during rewrite: {removed_image_count}")
+        else:
+            shutil.copy2(hdf5_path, output_path)
 
         with h5py.File(output_path, "a") as f:
-            if ignore_image:
-                removed_image_count = strip_image_observations_inplace(f)
-                print(f"  Removed image observation datasets: {removed_image_count}")
             if latent_mapping:
                 meta_group = f.require_group("meta")
                 mapping_group = meta_group.require_group("latent_mapping")
@@ -3263,6 +3263,80 @@ def _is_image_obs_key(name: str) -> bool:
     return any(tok in norm for tok in IMAGE_OBS_TOKENS)
 
 
+def _copy_h5_attrs(src_obj, dst_obj):
+    for key, value in src_obj.attrs.items():
+        dst_obj.attrs[key] = value
+
+
+def _create_dataset_like(src_dataset, dst_group, name):
+    dataset_kwargs = {}
+    if src_dataset.chunks is not None:
+        dataset_kwargs["chunks"] = src_dataset.chunks
+    if src_dataset.compression is not None:
+        dataset_kwargs["compression"] = src_dataset.compression
+    if src_dataset.compression_opts is not None:
+        dataset_kwargs["compression_opts"] = src_dataset.compression_opts
+    if src_dataset.shuffle:
+        dataset_kwargs["shuffle"] = src_dataset.shuffle
+    if src_dataset.fletcher32:
+        dataset_kwargs["fletcher32"] = src_dataset.fletcher32
+    if src_dataset.scaleoffset is not None:
+        dataset_kwargs["scaleoffset"] = src_dataset.scaleoffset
+    if src_dataset.maxshape is not None:
+        dataset_kwargs["maxshape"] = src_dataset.maxshape
+    dst_dataset = dst_group.create_dataset(
+        name,
+        data=src_dataset[()],
+        dtype=src_dataset.dtype,
+        **dataset_kwargs,
+    )
+    _copy_h5_attrs(src_dataset, dst_dataset)
+
+
+def _copy_h5_group(src_group, dst_group, group_path="", skip_images=False):
+    skipped_count = 0
+    _copy_h5_attrs(src_group, dst_group)
+    for child_name, child_obj in src_group.items():
+        child_path = f"{group_path}/{child_name}" if group_path else f"/{child_name}"
+        if (
+            skip_images
+            and (group_path.endswith("/obs") or group_path.endswith("/next_obs"))
+            and _is_image_obs_key(child_name)
+        ):
+            skipped_count += 1
+            continue
+        if isinstance(child_obj, h5py.Group):
+            new_group = dst_group.create_group(child_name)
+            skipped_count += _copy_h5_group(child_obj, new_group, child_path, skip_images=skip_images)
+        elif isinstance(child_obj, h5py.Dataset):
+            _create_dataset_like(child_obj, dst_group, child_name)
+        else:
+            raise TypeError(f"Unsupported HDF5 object at {child_path}: {type(child_obj)!r}")
+    return skipped_count
+
+
+def rewrite_hdf5_file(src_path, dst_path, skip_images=False):
+    src_path = Path(src_path)
+    dst_path = Path(dst_path)
+    with h5py.File(str(src_path), "r") as src_h5, h5py.File(str(dst_path), "w") as dst_h5:
+        removed = _copy_h5_group(src_h5, dst_h5, "", skip_images=skip_images)
+    try:
+        shutil.copystat(src_path, dst_path)
+    except Exception:
+        pass
+    return removed
+
+
+def repack_hdf5_file_inplace(path, skip_images=False):
+    path = Path(path)
+    tmp_path = path.with_name(path.name + ".repack_tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    removed = rewrite_hdf5_file(path, tmp_path, skip_images=skip_images)
+    os.replace(str(tmp_path), str(path))
+    return removed
+
+
 def strip_image_observations_inplace(h5_file: h5py.File) -> int:
     data_group = h5_file.get("data")
     if not isinstance(data_group, h5py.Group):
@@ -3281,6 +3355,28 @@ def strip_image_observations_inplace(h5_file: h5py.File) -> int:
                 del obs_group[key]
                 removed += 1
     return removed
+
+
+def repack_dataset_hdf5s(dataset_path, strip_images=False):
+    dataset_path = os.path.expanduser(str(dataset_path))
+    if os.path.isfile(dataset_path):
+        files = [dataset_path] if dataset_path.endswith(".hdf5") else []
+    elif os.path.isdir(dataset_path):
+        files = sorted(glob.glob(os.path.join(dataset_path, "**", "*.hdf5"), recursive=True))
+    else:
+        raise FileNotFoundError(f"{dataset_path} does not exist")
+    if not files:
+        raise RuntimeError(f"No hdf5 files found under: {dataset_path}")
+    print(f"Repacking {len(files)} HDF5 files under {dataset_path}")
+    total_removed = 0
+    for idx, hdf5_file in enumerate(files, start=1):
+        removed = repack_hdf5_file_inplace(hdf5_file, skip_images=bool(strip_images))
+        total_removed += int(removed)
+        print(f"  [{idx}/{len(files)}] {hdf5_file} removed_image_datasets={removed}")
+    print(
+        f"Finished repack: files={len(files)}, "
+        f"removed_image_datasets={total_removed}, strip_images={bool(strip_images)}"
+    )
 
 
 def discover_excluded_hdf5_files(exclude_data: object) -> Tuple[Set[str], List[str]]:
@@ -3477,6 +3573,8 @@ def main():
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing object_pcds")
     parser.add_argument(
         "--skip-existing-output",
+        "--continue",
+        dest="skip_existing_output",
         action="store_true",
         help="Skip processing when target output *_pcd.hdf5 already exists.",
     )
@@ -3484,8 +3582,17 @@ def main():
         "--ignore-image",
         action="store_true",
         help=(
-            "Remove image-like observation datasets (e.g. *image*, *rgb*, *depth*) "
-            "from the copied output HDF5 while keeping non-image data."
+            "Rewrite HDF5 without image-like observation datasets (e.g. *image*, *rgb*, *depth*) "
+            "while keeping non-image data. When used with --repack-root, strip images during repack too."
+        ),
+    )
+    parser.add_argument(
+        "--repack-root",
+        type=str,
+        default=None,
+        help=(
+            "Optional existing HDF5 file or dataset root to rewrite in place and reclaim free space. "
+            "Useful for already-generated outputs that removed image keys in-place and became oversized."
         ),
     )
     parser.add_argument(
@@ -3504,6 +3611,10 @@ def main():
 
     if args.overwrite and args.skip_existing_output:
         parser.error("--overwrite and --skip-existing-output cannot be enabled together")
+
+    if args.repack_root:
+        repack_dataset_hdf5s(args.repack_root, strip_images=bool(args.ignore_image))
+        return
 
     process_dataset(
         args.dataset,
