@@ -93,8 +93,14 @@ def geom_top_center(
     if geom_type == "plane":
         return geom_world_pos.copy(), geom_world_quat.copy()
     if geom_type == "box" and len(size_vals) >= 3:
-        local_top = np.asarray([0.0, 0.0, float(size_vals[2])], dtype=np.float64)
-        return transform_point(local_top, geom_world_pos, geom_world_quat), geom_world_quat.copy()
+        hx, hy, hz = float(size_vals[0]), float(size_vals[1]), float(size_vals[2])
+        R = quat_to_rotmat_wxyz(geom_world_quat)
+        world_z_half = abs(R[2, 0]) * hx + abs(R[2, 1]) * hy + abs(R[2, 2]) * hz
+        top_pos = np.asarray(
+            [geom_world_pos[0], geom_world_pos[1], geom_world_pos[2] + world_z_half],
+            dtype=np.float64,
+        )
+        return top_pos, geom_world_quat.copy()
     if geom_type == "cylinder" and len(size_vals) >= 2:
         local_top = np.asarray([0.0, 0.0, float(size_vals[1])], dtype=np.float64)
         return transform_point(local_top, geom_world_pos, geom_world_quat), geom_world_quat.copy()
@@ -129,6 +135,7 @@ def infer_table_pose_from_model_xml(model_xml: str) -> Optional[Tuple[np.ndarray
 
     def visit_body(body_elem: ET.Element, parent_pos: np.ndarray, parent_quat: np.ndarray) -> None:
         nonlocal best
+        body_name_l = (body_elem.get("name") or "").lower()
         body_pos = parse_xyz(body_elem.get("pos"))
         body_quat = parse_quat_wxyz(body_elem.get("quat"))
         world_quat = quat_mul_wxyz(parent_quat, body_quat)
@@ -136,6 +143,14 @@ def infer_table_pose_from_model_xml(model_xml: str) -> Optional[Tuple[np.ndarray
 
         for geom in body_elem.findall("geom"):
             score = score_scene_surface_geom(geom.get("name", ""), geom.get("material", ""))
+            # Scenes like LIVING_ROOM / STUDY have table bodies whose collision box
+            # geoms carry no name or material.  Score them the same way as a named
+            # table geom so they beat the floor fallback.
+            inferred_from_body = False
+            if score < 0 and geom.get("type", "").lower() == "box":
+                if any(k in body_name_l for k in ("table", "desk")):
+                    score = 65
+                    inferred_from_body = True
             if score < 0:
                 continue
             geom_pos = parse_xyz(geom.get("pos"))
@@ -148,6 +163,11 @@ def infer_table_pose_from_model_xml(model_xml: str) -> Optional[Tuple[np.ndarray
                 geom_world_pos=geom_world_pos,
                 geom_world_quat=geom_world_quat,
             )
+            # For geoms inferred via body name the geom itself may be arbitrarily
+            # rotated, but the table surface is always horizontal.  Force identity
+            # so the pose orientation matches every other correctly-handled scene.
+            if inferred_from_body:
+                top_quat = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
             label = geom.get("name") or geom.get("material") or "scene_surface"
             cand = (score, top_center, top_quat, label)
             if best is None or score > best[0]:

@@ -15,6 +15,7 @@ Key behaviors:
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -37,6 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ASSETS_BASE_PATH = REPO_ROOT / "libero" / "libero" / "assets"
 BDDL_BASE_PATH = REPO_ROOT / "libero" / "libero" / "bddl_files"
+BDDL_NEW_BASE_PATH = REPO_ROOT / "libero" / "libero" / "bddl_files_new"
 MESH_EXTENSIONS = {".obj", ".msh", ".stl"}
 MJ_GEOM_TYPE_TO_PRIMITIVE = {2: "sphere", 3: "capsule", 4: "ellipsoid", 5: "cylinder", 6: "box"}
 GRIPPER_ENTITY_NAME = "robot_gripper"
@@ -1512,73 +1514,190 @@ def inspect_gripper_signal_layout(demo_group):
 
 
 
+def _decode_attr_text(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="ignore")
+    if isinstance(value, np.bytes_):
+        return bytes(value).decode("utf-8", errors="ignore")
+    return str(value)
+
+
+def _tokenize_bddl_text(text):
+    tokens = []
+    for line in str(text).splitlines():
+        line = line.split(";", 1)[0]
+        if not line.strip():
+            continue
+        tokens.extend(line.replace("(", " ( ").replace(")", " ) ").split())
+    return tokens
+
+
+def _parse_bddl_tokens(tokens):
+    def parse_at(index):
+        if index >= len(tokens):
+            raise RuntimeError("Unexpected end of BDDL while parsing.")
+        token = tokens[index]
+        if token != "(":
+            if token == ")":
+                raise RuntimeError("Unexpected ')' in BDDL.")
+            return token, index + 1
+        expr = []
+        index += 1
+        while index < len(tokens) and tokens[index] != ")":
+            child, index = parse_at(index)
+            expr.append(child)
+        if index >= len(tokens):
+            raise RuntimeError("Unclosed '(' in BDDL.")
+        return expr, index + 1
+
+    expr, next_index = parse_at(0)
+    if next_index != len(tokens):
+        raise RuntimeError("BDDL has trailing tokens after top-level expression.")
+    return expr
+
+
+def _bddl_section(root, section_name):
+    for child in root:
+        if isinstance(child, list) and child and child[0] == section_name:
+            return child
+    return None
+
+
+def _typed_section_pairs(section, default_category):
+    pairs = []
+    pending = []
+    idx = 1
+    while idx < len(section):
+        token = section[idx]
+        if token == "-":
+            idx += 1
+            if idx >= len(section):
+                raise RuntimeError("Malformed typed BDDL section: '-' without category.")
+            category = str(section[idx])
+            pairs.extend((str(name), category) for name in pending)
+            pending = []
+        else:
+            pending.append(str(token))
+        idx += 1
+    pairs.extend((str(name), str(default_category)) for name in pending)
+    return pairs
+
+
 def extract_object_names_from_bddl(bddl_file_path):
     if not os.path.exists(bddl_file_path):
         return []
 
-    objects = []
-    with open(bddl_file_path, "r") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if " - " not in line:
-                continue
-            left, right = line.split(" - ", 1)
-            obj_type = right.strip()
-            instances = left.strip().split()
-            for inst in instances:
-                if "_" not in inst:
+    try:
+        text = Path(bddl_file_path).read_text(encoding="utf-8")
+        root = _parse_bddl_tokens(_tokenize_bddl_text(text))
+        typed_sections = [
+            section
+            for section in (_bddl_section(root, ":fixtures"), _bddl_section(root, ":objects"))
+            if section is not None
+        ]
+        if not typed_sections:
+            return []
+        objects = []
+        for section in typed_sections:
+            default_category = "fixture" if section[0] == ":fixtures" else "object"
+            objects.extend(
+                (inst, obj_type)
+                for inst, obj_type in _typed_section_pairs(section, default_category)
+                if "_" in inst and inst.split("_")[-1].isdigit()
+            )
+        return objects
+    except Exception as exc:
+        print(f"  Warning: typed BDDL parse failed for {bddl_file_path}, falling back to line parser: {exc}")
+        objects = []
+        with open(bddl_file_path, "r") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if " - " not in line:
                     continue
-                if inst.split("_")[-1].isdigit():
-                    objects.append((inst, obj_type))
-
-    return objects
+                left, right = line.split(" - ", 1)
+                obj_type = right.strip()
+                instances = left.strip().split()
+                for inst in instances:
+                    if "_" not in inst:
+                        continue
+                    if inst.split("_")[-1].isdigit():
+                        objects.append((inst, obj_type))
+        return objects
 
 
 def find_bddl_file(bddl_file_name):
     if not bddl_file_name:
         return None
 
-    parts = bddl_file_name.split("/")
+    candidate = Path(str(bddl_file_name)).expanduser()
+    if candidate.is_file():
+        return str(candidate.resolve())
+
+    parts = str(bddl_file_name).split("/")
     subdir = parts[-2] if len(parts) >= 2 else ""
     basename = parts[-1]
 
-    exact = (BDDL_BASE_PATH / subdir / basename) if subdir else (BDDL_BASE_PATH / basename)
-    if exact.exists():
-        return str(exact)
+    prefer_new_tree = "bddl_files_new" in str(bddl_file_name).replace("\\", "/")
+    base_paths = (BDDL_NEW_BASE_PATH, BDDL_BASE_PATH) if prefer_new_tree else (BDDL_BASE_PATH, BDDL_NEW_BASE_PATH)
 
-    search_dir = (BDDL_BASE_PATH / subdir) if subdir else BDDL_BASE_PATH
-    if not search_dir.exists():
-        # Some datasets store stale folder names in env_args (e.g. libero_100).
-        # Fall back to searching the full BDDL tree by filename.
-        global_exact = list(BDDL_BASE_PATH.rglob(basename))
-        if global_exact:
-            return str(global_exact[0])
-        search_dir = BDDL_BASE_PATH
+    for base_path in base_paths:
+        exact = (base_path / subdir / basename) if subdir else (base_path / basename)
+        if exact.exists():
+            return str(exact)
+
+    search_dirs = []
+    for base_path in base_paths:
+        search_dir = (base_path / subdir) if subdir else base_path
+        if search_dir.exists():
+            search_dirs.append(search_dir)
+        else:
+            search_dirs.append(base_path)
 
     basename_no_ext = Path(basename).stem
-    for p in search_dir.rglob("*.bddl"):
-        if Path(p).stem == basename_no_ext:
-            return str(p)
+    for search_dir in search_dirs:
+        for p in search_dir.rglob("*.bddl"):
+            if Path(p).stem == basename_no_ext:
+                return str(p)
 
     # fallback loose match
     tokens = set(basename_no_ext.split("_"))
     best = None
     best_score = -1
-    for p in search_dir.rglob("*.bddl"):
-        cand_tokens = set(Path(p).stem.split("_"))
-        score = len(tokens.intersection(cand_tokens))
-        if score > best_score:
-            best_score = score
-            best = p
+    for search_dir in search_dirs:
+        for p in search_dir.rglob("*.bddl"):
+            cand_tokens = set(Path(p).stem.split("_"))
+            score = len(tokens.intersection(cand_tokens))
+            if score > best_score:
+                best_score = score
+                best = p
     return str(best) if best is not None else None
+
+
+def _materialize_bddl_content_from_hdf5(hdf5_path, content, preferred_name="embedded.bddl"):
+    text = _decode_attr_text(content).strip()
+    if not text:
+        return None
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+    stem = Path(str(preferred_name)).stem or "embedded"
+    out_dir = Path("/tmp/sdf_wm_bddl_from_hdf5")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{Path(hdf5_path).stem}_{stem}_{digest}.bddl"
+    if not out_path.exists() or out_path.read_text(encoding="utf-8", errors="ignore") != text:
+        out_path.write_text(text + "\n", encoding="utf-8")
+    return str(out_path)
 
 
 def get_object_types_and_bddl(hdf5_path):
     with h5py.File(hdf5_path, "r") as f:
-        env_args = json.loads(f["data"].attrs["env_args"])
+        env_args = json.loads(_decode_attr_text(f["data"].attrs["env_args"]))
         bddl_file_name = env_args.get("env_kwargs", {}).get("bddl_file_name", "")
+        if not bddl_file_name:
+            bddl_file_name = _decode_attr_text(f["data"].attrs.get("bddl_file_name", ""))
+        bddl_file_content = f["data"].attrs.get("bddl_file_content", None)
 
     bddl_path = find_bddl_file(bddl_file_name)
+    if not bddl_path and bddl_file_content is not None:
+        bddl_path = _materialize_bddl_content_from_hdf5(hdf5_path, bddl_file_content, bddl_file_name)
     if not bddl_path:
         return [], None
 
