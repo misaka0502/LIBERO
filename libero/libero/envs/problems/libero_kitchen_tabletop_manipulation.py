@@ -197,9 +197,17 @@ class Libero_Kitchen_Tabletop_Manipulation(BDDLBaseDomain):
             ],
         )
 
-        # For visualization purpose
+        # Approx. real-robot cam_01 / cam_02 azimuths in LIBERO frame
+        # (leveled look-at table; pulled back slightly for FOV).
         mujoco_arena.set_camera(
-            camera_name="frontview", pos=[1.0, 0.0, 1.48], quat=[0.56, 0.43, 0.43, 0.56]
+            camera_name="frontview",
+            pos=[0.6034, -0.642082, 1.317054],
+            quat=[0.737651, 0.562542, 0.226421, 0.296902],
+        )
+        mujoco_arena.set_camera(
+            camera_name="sideview",
+            pos=[-0.214, 0.66314, 1.82384],
+            quat=[0.099353, 0.035692, -0.336205, -0.935853],
         )
         mujoco_arena.set_camera(
             camera_name="galleryview",

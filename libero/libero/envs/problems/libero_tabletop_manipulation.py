@@ -196,9 +196,16 @@ class Libero_Tabletop_Manipulation(BDDLBaseDomain):
             ],
         )
 
-        # For visualization purpose
+        # frontview ~= real cam_01; tabletop manually tuned (Open3D look-at).
         mujoco_arena.set_camera(
-            camera_name="frontview", pos=[1.0, 0.0, 1.48], quat=[0.56, 0.43, 0.43, 0.56]
+            camera_name="frontview",
+            pos=[-0.980557, -0.578165, 1.396682],
+            quat=[0.721268, 0.470971, -0.277687, -0.425264],
+        )
+        mujoco_arena.set_camera(
+            camera_name="sideview",
+            pos=[-0.818862, 0.657241, 1.4],
+            quat=[0.365676, 0.230888, -0.481377, -0.762396],
         )
         mujoco_arena.set_camera(
             camera_name="galleryview",

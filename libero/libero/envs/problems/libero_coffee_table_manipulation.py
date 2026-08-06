@@ -186,6 +186,17 @@ class Libero_Coffee_Table_Manipulation(BDDLBaseDomain):
         mujoco_arena.set_camera(
             camera_name="agentview", pos=[1.5, 0.0, 0.9], quat=[0.56, 0.43, 0.43, 0.56]
         )
+        # Approx. real-robot cam_01 / cam_02 azimuths (coffee-table height).
+        mujoco_arena.set_camera(
+            camera_name="frontview",
+            pos=[-0.440497, -0.953133, 0.95],
+            quat=[0.825825, 0.521426, -0.114664, -0.181602],
+        )
+        mujoco_arena.set_camera(
+            camera_name="sideview",
+            pos=[-0.818862, 0.657241, 0.95],
+            quat=[0.365676, 0.230888, -0.481377, -0.762396],
+        )
         mujoco_arena.set_camera(
             camera_name="galleryview",
             pos=[2.844547668904445, 2.1279684793440667, 3.128616846013882],

@@ -197,9 +197,16 @@ class Libero_Living_Room_Tabletop_Manipulation(BDDLBaseDomain):
             ],
         )
 
-        # For visualization purpose
+        # Approx. real-robot cam_01 / cam_02 azimuths (living-room table height).
         mujoco_arena.set_camera(
-            camera_name="frontview", pos=[1.5, 0.0, 0.9], quat=[0.56, 0.43, 0.43, 0.56]
+            camera_name="frontview",
+            pos=[0.527, -0.56255, 0.7678],
+            quat=[0.737651, 0.562542, 0.226421, 0.296902],
+        )
+        mujoco_arena.set_camera(
+            camera_name="sideview",
+            pos=[-0.818862, 0.657241, 0.95],
+            quat=[0.365676, 0.230888, -0.481377, -0.762396],
         )
         mujoco_arena.set_camera(
             camera_name="galleryview",

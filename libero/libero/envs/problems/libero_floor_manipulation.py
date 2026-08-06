@@ -193,9 +193,16 @@ class Libero_Floor_Manipulation(BDDLBaseDomain):
             ],
         )
 
-        # For visualization purpose
+        # Approx. real-robot cam_01 / cam_02 azimuths (floor arena height).
         mujoco_arena.set_camera(
-            camera_name="frontview", pos=[1.0, 0.0, 0.65], quat=[0.56, 0.43, 0.43, 0.56]
+            camera_name="frontview",
+            pos=[-0.440497, -0.953133, 0.7],
+            quat=[0.853214, 0.475288, -0.104518, -0.187625],
+        )
+        mujoco_arena.set_camera(
+            camera_name="sideview",
+            pos=[-0.818862, 0.657241, 0.7],
+            quat=[0.377804, 0.210458, -0.438783, -0.787681],
         )
         mujoco_arena.set_camera(
             camera_name="galleryview",
